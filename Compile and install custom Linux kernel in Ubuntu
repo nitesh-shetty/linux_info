@@ -7,6 +7,9 @@ Disable secure boot in bootloader and boot the Ubuntu.
 Tools installation:
   sudo apt-get install git build-essential kernel-package fakeroot libncurses5-dev libssl-dev ccache bison flex libelf-dev dwarves
 
+Download source code for Linux kernel:
+	git clone git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+	cd linux
 Build the kernel:
 	cp /boot/config-$(uname -r) .config
 	scripts/config --disable DEBUG_INFO
@@ -20,3 +23,4 @@ Install kernel:
 	sudo dpkg -i ../linux-image-4.4.0-rc8-stock_4.4.0-rc8-stock-144_amd64.deb
 
 Reboot PC/Server with *-custom kernel build using above method.
+Verify kernel version using, uname -r
