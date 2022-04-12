@@ -16,8 +16,8 @@ Build the kernel:
 	scripts/config --disable SYSTEM_TRUSTED_KEYS
 	scripts/config --disable SYSTEM_REVOCATION_KEYS
 	scripts/config --disable DEBUG_INFO_BTF
-	make -j $(getconf _NPROCESSORS_ONLN) bindeb-pkg LOCALVERSION=-custom
-
+	make -j $(getconf _NPROCESSORS_ONLN) olddefconfig bindeb-pkg LOCALVERSION=-custom
+	
 Install kernel:
 	sudo dpkg -i ../linux-headers-4.4.0-rc8-stock_4.4.0-rc8-stock-144_amd64.deb
 	sudo dpkg -i ../linux-image-4.4.0-rc8-stock_4.4.0-rc8-stock-144_amd64.deb
