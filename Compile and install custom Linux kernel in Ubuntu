@@ -1,0 +1,22 @@
+#Below steps cover steps to compile and install Linux kernel for Ubuntu.
+
+Tested in Ubuntu 20.04, Linux kernel version 5.18-rc2
+
+Disable secure boot in bootloader and boot the Ubuntu.
+
+Tools installation:
+  sudo apt-get install git build-essential kernel-package fakeroot libncurses5-dev libssl-dev ccache bison flex libelf-dev dwarves
+
+Build the kernel:
+	cp /boot/config-$(uname -r) .config
+	scripts/config --disable DEBUG_INFO
+	scripts/config --disable SYSTEM_TRUSTED_KEYS
+	scripts/config --disable SYSTEM_REVOCATION_KEYS
+	scripts/config --disable DEBUG_INFO_BTF
+	make -j $(getconf _NPROCESSORS_ONLN) bindeb-pkg LOCALVERSION=-custom
+
+Install kernel:
+	sudo dpkg -i ../linux-headers-4.4.0-rc8-stock_4.4.0-rc8-stock-144_amd64.deb
+	sudo dpkg -i ../linux-image-4.4.0-rc8-stock_4.4.0-rc8-stock-144_amd64.deb
+
+Reboot PC/Server with *-custom kernel build using above method.
