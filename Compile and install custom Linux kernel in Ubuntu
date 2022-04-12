@@ -5,7 +5,7 @@ Tested in Ubuntu 20.04, Linux kernel version 5.18-rc2
 Disable secure boot in bootloader and boot the Ubuntu.
 
 Tools installation:
-  sudo apt-get install git build-essential kernel-package fakeroot libncurses5-dev libssl-dev ccache bison flex libelf-dev dwarves
+  sudo apt-get install git build-essential kernel-package fakeroot libncurses5-dev libssl-dev ccache bison flex libelf-dev dwarves zstd
 
 Download source code for Linux kernel:
 	git clone git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
