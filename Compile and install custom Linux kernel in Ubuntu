@@ -17,10 +17,10 @@ Build the kernel:
 	scripts/config --disable SYSTEM_REVOCATION_KEYS
 	scripts/config --disable DEBUG_INFO_BTF
 	make -j $(getconf _NPROCESSORS_ONLN) olddefconfig bindeb-pkg LOCALVERSION=-custom
-	
+
 Install kernel:
-	sudo dpkg -i ../linux-headers-4.4.0-rc8-stock_4.4.0-rc8-stock-144_amd64.deb
-	sudo dpkg -i ../linux-image-4.4.0-rc8-stock_4.4.0-rc8-stock-144_amd64.deb
+	sudo dpkg -i ../linux-headers-5.18.0-rc2-next-20220412-custom_5.18.0-rc2-next-20220412-custom-1_amd64.deb
+	sudo dpkg -i ../linux-image-5.18.0-rc2-next-20220412-custom_5.18.0-rc2-next-20220412-custom-1_amd64.deb
 
 Reboot PC/Server with *-custom kernel build using above method.
 Verify kernel version using,
