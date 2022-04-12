@@ -23,4 +23,5 @@ Install kernel:
 	sudo dpkg -i ../linux-image-4.4.0-rc8-stock_4.4.0-rc8-stock-144_amd64.deb
 
 Reboot PC/Server with *-custom kernel build using above method.
-Verify kernel version using, uname -r
+Verify kernel version using,
+	uname -r
