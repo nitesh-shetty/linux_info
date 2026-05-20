@@ -1,0 +1,29 @@
+flowchart LR
+    subgraph Normal["Normal IO (per-IO)"]
+        direction TB
+        N1["Allocate bio + io_kiocb"]
+        N2["dma_map_page() x N"]
+        N3["Allocate + fill PRP/SGL entries"]
+        N4["Submit to NVMe HW"]
+        N5["dma_unmap_page() x N"]
+        N6["Free PRP list + bio + kiocb"]
+    end
+
+    Normal -->|each IO| Cost1["Cost: N * dma_map + N * dma_unmap<br/>+ alloc/free per IO"]
+
+    subgraph Slot["Registered Slot IO (per-IO)"]
+        direction TB
+        S1["Reuse embedded bio + kiocb (0 alloc)"]
+        S2["0 dma_map (precomputed at registration)"]
+        S3["0 PRP alloc (precomputed at registration)"]
+        S4["Submit to NVMe HW"]
+        S5["0 dma_unmap (slot owns the mapping)"]
+        S6["0 free (reused for next IO)"]
+    end
+
+    Slot -->|each IO| Cost2["Cost: 0 dma calls<br/>+ 0 alloc/free"]
+
+    style Normal fill:#fdd,stroke:#c00
+    style Slot fill:#dfd,stroke:#090
+    style Cost1 fill:#fee,stroke:#c00
+    style Cost2 fill:#efe,stroke:#090
