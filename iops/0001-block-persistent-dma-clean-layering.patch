@@ -1,0 +1,997 @@
+diff --git a/block/Makefile b/block/Makefile
+index 7dce2e44276c..ee57b94a3c02 100644
+--- a/block/Makefile
++++ b/block/Makefile
+@@ -9,7 +9,8 @@ obj-y		:= bdev.o fops.o bio.o elevator.o blk-core.o blk-sysfs.o \
+ 			blk-mq-tag.o blk-mq-dma.o blk-stat.o \
+ 			blk-mq-sysfs.o blk-mq-cpumap.o blk-mq-sched.o ioctl.o \
+ 			genhd.o ioprio.o badblocks.o partitions/ blk-rq-qos.o \
+-			disk-events.o blk-ia-ranges.o early-lookup.o
++			disk-events.o blk-ia-ranges.o early-lookup.o \
++			blk-persistent-dma.o
+ 
+ obj-$(CONFIG_BLK_DEV_BSG_COMMON) += bsg.o
+ obj-$(CONFIG_BLK_DEV_BSGLIB)	+= bsg-lib.o
+diff --git a/block/blk-persistent-dma.c b/block/blk-persistent-dma.c
+new file mode 100644
+index 000000000000..07a8e1e14f0e
+--- /dev/null
++++ b/block/blk-persistent-dma.c
+@@ -0,0 +1,292 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Persistent DMA mappings for the block layer.
++ *
++ * Provides a mechanism to DMA-map a buffer once at registration time
++ * and reuse the mapping for every I/O. Used by io_uring registered IO
++ * slots to eliminate per-I/O dma_map / dma_unmap overhead.
++ *
++ * The mapping can be either:
++ *   - IOVA-based (IOMMU coalesces the whole buffer into a single IOVA range)
++ *   - Direct (per-page dma_map_page, stored in seg_addrs[])
++ */
++#include <linux/blk-persistent-dma.h>
++#include <linux/bio.h>
++#include <linux/blkdev.h>
++#include <linux/dma-mapping.h>
++#include <linux/slab.h>
++#include <linux/overflow.h>
++
++struct blk_persistent_dma {
++	struct dma_iova_state	state;
++	dma_addr_t		*seg_addrs;
++	size_t			*seg_lens;	/* per-segment lengths, direct path only */
++	unsigned int		nr_segs;
++	unsigned int		folio_shift;
++	size_t			len;
++	struct device		*dma_dev;
++	enum dma_data_direction	dir;
++
++	void			*driver_priv;
++	void			(*driver_priv_destroy)(struct blk_persistent_dma *dma);
++};
++
++int blk_persistent_dma_map(struct request_queue *q,
++			   const struct bio_vec *bvecs,
++			   unsigned int nr_bvecs,
++			   unsigned int folio_shift,
++			   size_t total_len,
++			   struct blk_persistent_dma **out)
++{
++	struct device *dma_dev = q->dma_dev;
++	struct blk_persistent_dma *dma;
++	const enum dma_data_direction dir = DMA_BIDIRECTIONAL;
++	size_t mapped = 0;
++	unsigned int i;
++	int ret;
++
++	if (!dma_dev)
++		return -EOPNOTSUPP;
++
++	dma = kzalloc(sizeof(*dma), GFP_KERNEL_ACCOUNT);
++	if (!dma)
++		return -ENOMEM;
++
++	dma->dma_dev = dma_dev;
++	dma->dir = dir;
++	dma->nr_segs = nr_bvecs;
++	dma->len = total_len;
++	dma->folio_shift = folio_shift;
++
++	/* IOVA path: coalesce the whole buffer into a single IOVA range. */
++	if (dma_iova_try_alloc(dma_dev, &dma->state,
++			page_to_phys(bvecs[0].bv_page) + bvecs[0].bv_offset,
++			total_len)) {
++		for (i = 0; i < nr_bvecs; i++) {
++			const struct bio_vec *bv = &bvecs[i];
++			phys_addr_t phys =
++				page_to_phys(bv->bv_page) + bv->bv_offset;
++
++			ret = dma_iova_link(dma_dev, &dma->state, phys, mapped,
++					    bv->bv_len, dir, 0);
++			if (ret)
++				goto unlink;
++			mapped += bv->bv_len;
++		}
++		if (dma_iova_sync(dma_dev, &dma->state, 0, mapped)) {
++			ret = -EIO;
++			goto unlink;
++		}
++
++		if (q->persistent_dma_setup) {
++			ret = q->persistent_dma_setup(q, dma);
++			if (ret)
++				goto unlink;
++		}
++
++		*out = dma;
++		return 0;
++
++unlink:
++		while (i-- > 0) {
++			mapped -= bvecs[i].bv_len;
++			dma_iova_unlink(dma_dev, &dma->state, mapped,
++					bvecs[i].bv_len, dir, 0);
++		}
++		dma_iova_free(dma_dev, &dma->state);
++		kfree(dma);
++		return ret;
++	}
++
++	/* Direct path: per-bvec dma_map_page. */
++	dma->seg_addrs = kvmalloc_array(nr_bvecs, sizeof(dma_addr_t),
++					GFP_KERNEL_ACCOUNT);
++	dma->seg_lens = kvmalloc_array(nr_bvecs, sizeof(size_t),
++				       GFP_KERNEL_ACCOUNT);
++	if (!dma->seg_addrs || !dma->seg_lens) {
++		kvfree(dma->seg_addrs);
++		kvfree(dma->seg_lens);
++		kfree(dma);
++		return -ENOMEM;
++	}
++	for (i = 0; i < nr_bvecs; i++) {
++		const struct bio_vec *bv = &bvecs[i];
++		dma_addr_t addr;
++
++		addr = dma_map_page(dma_dev, bv->bv_page, bv->bv_offset,
++				    bv->bv_len, dir);
++		if (dma_mapping_error(dma_dev, addr)) {
++			while (i-- > 0)
++				dma_unmap_page(dma_dev, dma->seg_addrs[i],
++					       dma->seg_lens[i], dir);
++			kvfree(dma->seg_addrs);
++			kvfree(dma->seg_lens);
++			kfree(dma);
++			return -ENOMEM;
++		}
++		dma->seg_addrs[i] = addr;
++		dma->seg_lens[i] = bv->bv_len;
++	}
++
++	if (q->persistent_dma_setup) {
++		ret = q->persistent_dma_setup(q, dma);
++		if (ret) {
++			for (i = 0; i < nr_bvecs; i++)
++				dma_unmap_page(dma_dev, dma->seg_addrs[i],
++					       dma->seg_lens[i], dir);
++			kvfree(dma->seg_addrs);
++			kvfree(dma->seg_lens);
++			kfree(dma);
++			return ret;
++		}
++	}
++
++	*out = dma;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_map);
++
++void blk_persistent_dma_unmap(struct blk_persistent_dma *dma)
++{
++	unsigned int i;
++
++	if (!dma)
++		return;
++
++	if (dma->driver_priv_destroy)
++		dma->driver_priv_destroy(dma);
++
++	if (dma_use_iova(&dma->state)) {
++		dma_iova_destroy(dma->dma_dev, &dma->state, dma->len,
++				 dma->dir, 0);
++	} else {
++		for (i = 0; i < dma->nr_segs; i++)
++			dma_unmap_page(dma->dma_dev, dma->seg_addrs[i],
++				       dma->seg_lens[i], dma->dir);
++		kvfree(dma->seg_addrs);
++		kvfree(dma->seg_lens);
++	}
++	kfree(dma);
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_unmap);
++
++void blk_persistent_dma_sync(struct blk_persistent_dma *dma,
++			     const struct bio *bio,
++			     enum blk_persistent_dma_sync_dir dir)
++{
++	enum dma_data_direction dma_dir;
++	unsigned int idx;
++	size_t off, remaining;
++
++	if (!dma || !dma_dev_need_sync(dma->dma_dev))
++		return;
++
++	dma_dir = bio_data_dir(bio) == WRITE ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
++	idx = bio->bi_iter.bi_idx;
++	off = bio->bi_iter.bi_bvec_done;
++	remaining = bio->bi_iter.bi_size;
++
++	if (dma_use_iova(&dma->state)) {
++		size_t iova_off = blk_persistent_dma_buf_offset(dma, bio);
++		dma_addr_t base = dma->state.addr + iova_off;
++
++		if (dir == BLK_DMA_SYNC_FOR_DEVICE)
++			dma_sync_single_for_device(dma->dma_dev, base,
++						   remaining, dma_dir);
++		else
++			dma_sync_single_for_cpu(dma->dma_dev, base,
++						remaining, dma_dir);
++		return;
++	}
++
++	while (remaining && idx < dma->nr_segs) {
++		size_t seg_avail = bio->bi_io_vec[idx].bv_len - off;
++		size_t to_sync = min_t(size_t, seg_avail, remaining);
++
++		if (dir == BLK_DMA_SYNC_FOR_DEVICE)
++			dma_sync_single_for_device(dma->dma_dev,
++				dma->seg_addrs[idx] + off, to_sync, dma_dir);
++		else
++			dma_sync_single_for_cpu(dma->dma_dev,
++				dma->seg_addrs[idx] + off, to_sync, dma_dir);
++
++		remaining -= to_sync;
++		off = 0;
++		idx++;
++	}
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_sync);
++
++bool blk_persistent_dma_has_iova(const struct blk_persistent_dma *dma)
++{
++	return dma && dma_use_iova(&dma->state);
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_has_iova);
++
++dma_addr_t blk_persistent_dma_iova_base(const struct blk_persistent_dma *dma)
++{
++	return dma->state.addr;
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_iova_base);
++
++dma_addr_t blk_persistent_dma_addr_at(const struct blk_persistent_dma *dma,
++				      unsigned int bvec_idx,
++				      size_t bvec_offset)
++{
++	if (dma_use_iova(&dma->state))
++		return dma->state.addr; /* caller must add buf_offset */
++	return dma->seg_addrs[bvec_idx] + bvec_offset;
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_addr_at);
++
++size_t blk_persistent_dma_buf_offset(const struct blk_persistent_dma *dma,
++				     const struct bio *bio)
++{
++	unsigned int idx = bio->bi_iter.bi_idx;
++	size_t off = bio->bi_iter.bi_bvec_done;
++
++	if (!idx)
++		return off;
++	return bio->bi_io_vec[0].bv_len +
++	       ((size_t)(idx - 1) << dma->folio_shift) + off;
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_buf_offset);
++
++unsigned int blk_persistent_dma_nr_segs(const struct blk_persistent_dma *dma)
++{
++	return dma->nr_segs;
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_nr_segs);
++
++unsigned int blk_persistent_dma_folio_shift(const struct blk_persistent_dma *dma)
++{
++	return dma->folio_shift;
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_folio_shift);
++
++size_t blk_persistent_dma_len(const struct blk_persistent_dma *dma)
++{
++	return dma->len;
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_len);
++
++struct device *blk_persistent_dma_dev(const struct blk_persistent_dma *dma)
++{
++	return dma->dma_dev;
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_dev);
++
++void *blk_persistent_dma_driver_priv(const struct blk_persistent_dma *dma)
++{
++	return dma->driver_priv;
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_driver_priv);
++
++void blk_persistent_dma_set_driver_priv(struct blk_persistent_dma *dma,
++					void *priv,
++					void (*destroy)(struct blk_persistent_dma *))
++{
++	dma->driver_priv = priv;
++	dma->driver_priv_destroy = destroy;
++}
++EXPORT_SYMBOL_GPL(blk_persistent_dma_set_driver_priv);
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 7794a7951764..8b407dc4704c 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -643,9 +643,9 @@ struct nvme_ctrl_ops {
+ 
+ 	/* return device for DMA mappings */
+ 	struct device *(*dma_dev)(struct nvme_ctrl *ctrl);
+-	/* build persistent driver descriptor for io_slot_dma entry */
++	/* build persistent driver descriptor for blk_persistent_dma entry */
+ 	int (*persistent_dma_setup)(struct request_queue *q,
+-				    struct io_slot_dma *dma);
++				    struct blk_persistent_dma *dma);
+ };
+ 
+ /*
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index a579b12cb243..3e1b34af9a03 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -27,7 +27,7 @@
+ #include <linux/io-64-nonatomic-lo-hi.h>
+ #include <linux/io-64-nonatomic-hi-lo.h>
+ #include <linux/sed-opal.h>
+-#include <linux/io_uring_types.h>
++#include <linux/blk-persistent-dma.h>
+ 
+ #include "trace.h"
+ #include "nvme.h"
+@@ -1203,14 +1203,13 @@ static void nvme_pci_persistent_prp_free(struct nvme_pci_persistent_prp *ppp)
+ 	kfree(ppp);
+ }
+ 
+-static void nvme_pci_persistent_dma_destroy(struct io_slot_dma *dma)
++static void nvme_pci_persistent_dma_destroy(struct blk_persistent_dma *dma)
+ {
+-	nvme_pci_persistent_prp_free(dma->driver_priv);
+-	dma->driver_priv = NULL;
++	nvme_pci_persistent_prp_free(blk_persistent_dma_driver_priv(dma));
+ }
+ 
+ static int nvme_pci_persistent_dma_setup(struct request_queue *q,
+-					 struct io_slot_dma *dma)
++					 struct blk_persistent_dma *dma)
+ {
+ 	struct nvme_pci_persistent_prp *ppp;
+ 	dma_addr_t base, nvme_page_base;
+@@ -1218,17 +1217,17 @@ static int nvme_pci_persistent_dma_setup(struct request_queue *q,
+ 	unsigned int list_idx, entry_idx;
+ 	unsigned int i;
+ 
+-	if (dma_use_iova(&dma->state))
+-		base = dma->state.addr;
+-	else if (dma->nr_segs == 1)
+-		base = dma->seg_addrs[0];
++	if (blk_persistent_dma_has_iova(dma))
++		base = blk_persistent_dma_iova_base(dma);
++	else if (blk_persistent_dma_nr_segs(dma) == 1)
++		base = blk_persistent_dma_addr_at(dma, 0, 0);
+ 	else
+ 		return 0;
+ 
+ 	page_off = base & (NVME_CTRL_PAGE_SIZE - 1);
+ 	nvme_page_base = base & ~((dma_addr_t)NVME_CTRL_PAGE_SIZE - 1);
+-	total_pages = (page_off + dma->len + NVME_CTRL_PAGE_SIZE - 1) >>
+-		      NVME_CTRL_PAGE_SHIFT;
++	total_pages = (page_off + blk_persistent_dma_len(dma) +
++		       NVME_CTRL_PAGE_SIZE - 1) >> NVME_CTRL_PAGE_SHIFT;
+ 	if (total_pages < 2)
+ 		return 0;
+ 	nr_prps = total_pages - 1;	/* PRP1 covers page 0 */
+@@ -1236,7 +1235,7 @@ static int nvme_pci_persistent_dma_setup(struct request_queue *q,
+ 	ppp = kzalloc(sizeof(*ppp), GFP_KERNEL_ACCOUNT);
+ 	if (!ppp)
+ 		return -ENOMEM;
+-	ppp->dev = dma->dma_dev;
++	ppp->dev = blk_persistent_dma_dev(dma);
+ 	ppp->nr_list_pages = DIV_ROUND_UP(nr_prps, PRPS_PER_PAGE);
+ 
+ 	ppp->list_va = kvmalloc_array(ppp->nr_list_pages,
+@@ -1277,8 +1276,8 @@ static int nvme_pci_persistent_dma_setup(struct request_queue *q,
+ 		list[PRPS_PER_PAGE] = cpu_to_le64(ppp->list_dma[i + 1]);
+ 	}
+ 
+-	dma->driver_priv = ppp;
+-	dma->driver_priv_destroy = nvme_pci_persistent_dma_destroy;
++	blk_persistent_dma_set_driver_priv(dma, ppp,
++					   nvme_pci_persistent_dma_destroy);
+ 	return 0;
+ 
+ err_free_pages:
+@@ -1294,24 +1293,25 @@ static int nvme_pci_persistent_dma_setup(struct request_queue *q,
+ /*
+  * Return DMA address PRP list entry
+  */
+-static dma_addr_t nvme_pci_persistent_prp_ptr(struct io_slot_dma *dma,
++static dma_addr_t nvme_pci_persistent_prp_ptr(struct blk_persistent_dma *dma,
+ 					      dma_addr_t dma_addr,
+ 					      unsigned int prp1_offset)
+ {
+-	struct nvme_pci_persistent_prp *ppp = dma->driver_priv;
++	struct nvme_pci_persistent_prp *ppp;
+ 	dma_addr_t first_full_page;
+ 	unsigned int logical_idx;
+ 	unsigned int list_idx, entry_idx;
+ 	dma_addr_t base;
+ 
++	ppp = blk_persistent_dma_driver_priv(dma);
+ 	if (!ppp)
+ 		return 0;
+ 
+ 	first_full_page = dma_addr + (NVME_CTRL_PAGE_SIZE - prp1_offset);
+-	if (dma_use_iova(&dma->state))
+-		base = dma->state.addr;
++	if (blk_persistent_dma_has_iova(dma))
++		base = blk_persistent_dma_iova_base(dma);
+ 	else
+-		base = dma->seg_addrs[0];
++		base = blk_persistent_dma_addr_at(dma, 0, 0);
+ 	logical_idx = (first_full_page -
+ 		       (base & ~((dma_addr_t)NVME_CTRL_PAGE_SIZE - 1))) >>
+ 		      NVME_CTRL_PAGE_SHIFT;
+@@ -1334,7 +1334,7 @@ static blk_status_t nvme_pci_setup_data_registered(struct request *req)
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 	struct bio *bio = req->bio;
+-	struct io_slot_dma *dma;
++	struct blk_persistent_dma *dma;
+ 	unsigned int total = blk_rq_payload_bytes(req);
+ 	unsigned int prp1_offset;
+ 	dma_addr_t dma_addr;
+@@ -1345,12 +1345,14 @@ static blk_status_t nvme_pci_setup_data_registered(struct request *req)
+ 	if (!dma)
+ 		return BLK_STS_AGAIN;
+ 
+-	if (dma_use_iova(&dma->state)) {
++	if (blk_persistent_dma_has_iova(dma)) {
+ 		/* IOMMU coalesced the whole buffer into one IOVA range */
+-		dma_addr = dma->state.addr + io_slot_buf_offset(dma, bio);
+-	} else if (dma->nr_segs == 1) {
++		dma_addr = blk_persistent_dma_iova_base(dma) +
++			   blk_persistent_dma_buf_offset(dma, bio);
++	} else if (blk_persistent_dma_nr_segs(dma) == 1) {
+ 		/* Direct path, no coalescing done */
+-		dma_addr = dma->seg_addrs[0] + bio->bi_iter.bi_bvec_done;
++		dma_addr = blk_persistent_dma_addr_at(dma, 0, 0) +
++			   bio->bi_iter.bi_bvec_done;
+ 	} else {
+ 		/* Multi-segment direct path needs walking; fall back. */
+ 		return BLK_STS_AGAIN;
+@@ -1371,7 +1373,7 @@ static blk_status_t nvme_pci_setup_data_registered(struct request *req)
+ 		}
+ 
+ 		/* PRP-only path: use the precomputed list if available. */
+-		if (!dma->driver_priv)
++		if (!blk_persistent_dma_driver_priv(dma))
+ 			return BLK_STS_AGAIN;
+ 
+ 		iod->total_len = total;
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index e7af88db70b4..a290ff0f7974 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -53,12 +53,12 @@ static inline bool bio_flagged(const struct bio *bio, unsigned int bit)
+ 
+ /*
+  * For BIO_REGISTERED bios, bi_private holds a pointer to the persistent
+- * io_slot_dma state.
++ * blk_persistent_dma state.
+  *
+  * Returns NULL for bios that aren't part of a registered slot, in which
+  * case the driver should fall back to the regular dma map path.
+  */
+-static inline struct io_slot_dma *bio_persistent_dma(const struct bio *bio)
++static inline struct blk_persistent_dma *bio_persistent_dma(const struct bio *bio)
+ {
+ 	if (!bio_flagged(bio, BIO_REGISTERED))
+ 		return NULL;
+diff --git a/include/linux/blk-persistent-dma.h b/include/linux/blk-persistent-dma.h
+new file mode 100644
+index 000000000000..9a0ec580f668
+--- /dev/null
++++ b/include/linux/blk-persistent-dma.h
+@@ -0,0 +1,132 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _BLK_PERSISTENT_DMA_H
++#define _BLK_PERSISTENT_DMA_H
++
++#include <linux/types.h>
++#include <linux/dma-mapping.h>
++
++struct device;
++struct bio;
++struct request_queue;
++
++/*
++ * Opaque handle for a persistent DMA mapping. Created once at buffer
++ * registration time (e.g. by io_uring slots), consumed by block device
++ * drivers to obtain pre-computed DMA addresses without per-IO mapping.
++ *
++ * Layout is defined in block/blk-persistent-dma.c; drivers only ever
++ * deal with pointers and the public API below.
++ */
++struct blk_persistent_dma;
++
++/* Direction for cache sync operations */
++enum blk_persistent_dma_sync_dir {
++	BLK_DMA_SYNC_FOR_DEVICE,
++	BLK_DMA_SYNC_FOR_CPU,
++};
++
++/**
++ * blk_persistent_dma_map - build a persistent DMA mapping for a buffer
++ * @q: request_queue of the target device
++ * @bvecs: array of bio_vec describing the buffer
++ * @nr_bvecs: number of entries in @bvecs
++ * @folio_shift: log2 of the folio size (uniform across middle bvecs)
++ * @total_len: total buffer length in bytes
++ * @out: on success, points to the new mapping (must be released with unmap)
++ *
++ * Returns 0 on success, negative errno on failure.
++ */
++int blk_persistent_dma_map(struct request_queue *q,
++			   const struct bio_vec *bvecs,
++			   unsigned int nr_bvecs,
++			   unsigned int folio_shift,
++			   size_t total_len,
++			   struct blk_persistent_dma **out);
++
++/**
++ * blk_persistent_dma_unmap - tear down a persistent DMA mapping
++ * @dma: mapping to destroy (NULL is safe)
++ */
++void blk_persistent_dma_unmap(struct blk_persistent_dma *dma);
++
++/**
++ * blk_persistent_dma_sync - synchronise DMA buffer for CPU or device
++ * @dma: persistent DMA mapping
++ * @bio: bio describing the in-flight IO range
++ * @dir: sync direction
++ */
++void blk_persistent_dma_sync(struct blk_persistent_dma *dma,
++			     const struct bio *bio,
++			     enum blk_persistent_dma_sync_dir dir);
++
++/**
++ * blk_persistent_dma_has_iova - check if mapping uses a single IOVA range
++ * @dma: persistent DMA mapping
++ */
++bool blk_persistent_dma_has_iova(const struct blk_persistent_dma *dma);
++
++/**
++ * blk_persistent_dma_iova_base - get the base IOVA address
++ * @dma: persistent DMA mapping (must have IOVA)
++ */
++dma_addr_t blk_persistent_dma_iova_base(const struct blk_persistent_dma *dma);
++
++/**
++ * blk_persistent_dma_addr_at - get DMA address for a specific bvec
++ * @dma: persistent DMA mapping
++ * @bvec_idx: index into the original bvec array
++ * @bvec_offset: byte offset within that bvec
++ */
++dma_addr_t blk_persistent_dma_addr_at(const struct blk_persistent_dma *dma,
++				      unsigned int bvec_idx,
++				      size_t bvec_offset);
++
++/**
++ * blk_persistent_dma_buf_offset - compute byte offset into buffer from bio
++ * @dma: persistent DMA mapping
++ * @bio: bio whose bi_iter position to convert
++ */
++size_t blk_persistent_dma_buf_offset(const struct blk_persistent_dma *dma,
++				     const struct bio *bio);
++
++/**
++ * blk_persistent_dma_nr_segs - get number of DMA segments
++ * @dma: persistent DMA mapping
++ */
++unsigned int blk_persistent_dma_nr_segs(const struct blk_persistent_dma *dma);
++
++/**
++ * blk_persistent_dma_folio_shift - get the folio shift
++ * @dma: persistent DMA mapping
++ */
++unsigned int blk_persistent_dma_folio_shift(const struct blk_persistent_dma *dma);
++
++/**
++ * blk_persistent_dma_len - get total mapped length
++ * @dma: persistent DMA mapping
++ */
++size_t blk_persistent_dma_len(const struct blk_persistent_dma *dma);
++
++/**
++ * blk_persistent_dma_dev - get the DMA device
++ * @dma: persistent DMA mapping
++ */
++struct device *blk_persistent_dma_dev(const struct blk_persistent_dma *dma);
++
++/**
++ * blk_persistent_dma_driver_priv - get driver-private data
++ * @dma: persistent DMA mapping
++ */
++void *blk_persistent_dma_driver_priv(const struct blk_persistent_dma *dma);
++
++/**
++ * blk_persistent_dma_set_driver_priv - attach driver-private data
++ * @dma: persistent DMA mapping
++ * @priv: driver-private pointer
++ * @destroy: callback to free @priv, invoked during unmap
++ */
++void blk_persistent_dma_set_driver_priv(struct blk_persistent_dma *dma,
++					void *priv,
++					void (*destroy)(struct blk_persistent_dma *dma));
++
++#endif /* _BLK_PERSISTENT_DMA_H */
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 086fc96d7f11..229f04b92650 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -43,6 +43,7 @@ struct hd_geometry;
+ struct blk_report_zones_args;
+ struct blk_queue_stats;
+ struct blk_stat_callback;
++struct blk_persistent_dma;
+ struct blk_crypto_profile;
+ 
+ extern const struct device_type disk_type;
+@@ -539,11 +540,11 @@ struct request_queue {
+ 	struct device		*dma_dev;
+ 
+ 	/*
+-	 * build a driver-owned persistent DMA descriptor list on for a
+-	 * struct io_slot_dma entry.
++	 * build a driver-owned persistent DMA descriptor list for a
++	 * blk_persistent_dma entry (e.g. pre-computed PRP lists).
+ 	 */
+ 	int (*persistent_dma_setup)(struct request_queue *q,
+-				    struct io_slot_dma *dma);
++				    struct blk_persistent_dma *dma);
+ 
+ #ifdef CONFIG_PM
+ 	struct device		*dev;
+diff --git a/include/linux/io_uring_types.h b/include/linux/io_uring_types.h
+index d53ad4995366..ea0f8816e667 100644
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -6,7 +6,7 @@
+ #include <linux/task_work.h>
+ #include <linux/bitmap.h>
+ #include <linux/llist.h>
+-#include <linux/dma-mapping.h>
++#include <linux/blk-persistent-dma.h>
+ #include <uapi/linux/io_uring.h>
+ 
+ struct iou_loop_params;
+@@ -90,38 +90,7 @@ struct io_mapped_region {
+ 	unsigned		flags;
+ };
+ 
+-struct io_slot_dma {
+-	struct dma_iova_state	state;
+-	dma_addr_t		*seg_addrs;	/* nr_segs entries when !iova */
+-	unsigned int		nr_segs;
+-	unsigned int		folio_shift;	/* uniform-bvec shift; copied from imu */
+-	size_t			len;		/* total mapped length, == imu->len */
+-	struct device		*dma_dev;
+-	enum dma_data_direction	dir;
+-
+-	/*
+-	 * for devices needing persistent state for (generally) bigger buffer
+-	 * vectors, like a scatterlist.
+-	 */
+-	void			*driver_priv;
+-	void			(*driver_priv_destroy)(struct io_slot_dma *dma);
+-};
+-
+-/*
+- * For a BIO_REGISTERED bio, return the byte offset into the registered
+- * buffer that bio->bi_iter currently points at.
+- */
+-static inline size_t io_slot_buf_offset(const struct io_slot_dma *dma,
+-					const struct bio *bio)
+-{
+-	unsigned int idx = bio->bi_iter.bi_idx;
+-	size_t off = bio->bi_iter.bi_bvec_done;
+-
+-	if (!idx)
+-		return off;
+-	return bio->bi_io_vec[0].bv_len +
+-	       ((size_t)(idx - 1) << dma->folio_shift) + off;
+-}
++/* io_slot_dma moved to block layer as struct blk_persistent_dma */
+ 
+ /*
+  * Return value from io_buffer_list selection, to avoid stashing it in
+diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
+index 3f6a0787e774..09d5bb8ac7b3 100644
+--- a/io_uring/rsrc.c
++++ b/io_uring/rsrc.c
+@@ -167,16 +167,11 @@ static struct io_mapped_ubuf *io_alloc_imu(struct io_ring_ctx *ctx,
+ 		imu = io_cache_alloc(&ctx->imu_cache, GFP_KERNEL);
+ 	else
+ 		imu = kvmalloc_flex(struct io_mapped_ubuf, bvec, nr_bvecs);
+-	if (imu)
+-		INIT_LIST_HEAD(&imu->dma_mappings);
+ 	return imu;
+ }
+ 
+ static void io_free_imu(struct io_ring_ctx *ctx, struct io_mapped_ubuf *imu)
+ {
+-	/* Slots pin buf_node which pins imu, "can't happen" scenario */
+-	WARN_ON_ONCE(!list_empty(&imu->dma_mappings));
+-
+ 	if (imu->nr_bvecs <= IO_CACHED_BVECS_SEGS)
+ 		io_cache_free(&ctx->imu_cache, imu);
+ 	else
+diff --git a/io_uring/rsrc.h b/io_uring/rsrc.h
+index 6a157f830b89..5e42e055371f 100644
+--- a/io_uring/rsrc.h
++++ b/io_uring/rsrc.h
+@@ -42,11 +42,6 @@ struct io_mapped_ubuf {
+ 	u8		dir;
+ 	void		(*release)(void *);
+ 	void		*priv;
+-	/*
+-	 * persistent DMA mappings of this buffer, one for each dma_dev
+-	 * mapped, if any. Added on first slot registration of this buffer.
+-	 */
+-	struct list_head dma_mappings;
+ 
+ 	struct bio_vec	bvec[] __counted_by(nr_bvecs);
+ };
+diff --git a/io_uring/slot.c b/io_uring/slot.c
+index a3c208a5f44f..f1ada102b3fe 100644
+--- a/io_uring/slot.c
++++ b/io_uring/slot.c
+@@ -37,7 +37,7 @@ struct io_slot {
+ 	struct block_device	*bdev;
+ 	u64			part_offset;	/* bytes; 0 for whole-disk */
+ 	u64			part_size;	/* bytes; bdev_nr_sectors at register */
+-	struct io_slot_dma	*dma;
++	struct blk_persistent_dma *dma;
+ 
+ 	/* Set to a valid request when the slot is currently undergoing IO */
+ 	struct io_kiocb		*req;
+@@ -122,52 +122,14 @@ static void io_slot_table_remove(struct io_ring_ctx *ctx, unsigned int id)
+ 	t->slots[id] = NULL;
+ }
+ 
+-static void io_buf_put_dma(struct io_mapped_ubuf *imu, struct io_slot_dma *dma);
+-
+ static void io_slot_dma_sync(struct io_slot *slot, struct bio *bio,
+ 			     bool for_device)
+ {
+-	struct io_slot_dma *dma = slot->dma;
+-	enum dma_data_direction dir;
+-	unsigned int idx;
+-	size_t off;
+-	unsigned int remaining;
+-
+-	if (!dma || !dma_dev_need_sync(dma->dma_dev))
++	if (!slot->dma)
+ 		return;
+ 
+-	dir = bio_data_dir(bio) == WRITE ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
+-	idx = bio->bi_iter.bi_idx;
+-	off = bio->bi_iter.bi_bvec_done;
+-	remaining = bio->bi_iter.bi_size;
+-
+-	if (dma_use_iova(&dma->state)) {
+-		size_t iova_off = io_slot_buf_offset(dma, bio);
+-
+-		if (for_device)
+-			dma_sync_single_for_device(dma->dma_dev,
+-				dma->state.addr + iova_off, remaining, dir);
+-		else
+-			dma_sync_single_for_cpu(dma->dma_dev,
+-				dma->state.addr + iova_off, remaining, dir);
+-		return;
+-	}
+-
+-	while (remaining && idx < dma->nr_segs) {
+-		size_t seg_avail = bio->bi_io_vec[idx].bv_len - off;
+-		size_t to_sync = min_t(size_t, seg_avail, remaining);
+-
+-		if (for_device)
+-			dma_sync_single_for_device(dma->dma_dev,
+-				dma->seg_addrs[idx] + off, to_sync, dir);
+-		else
+-			dma_sync_single_for_cpu(dma->dma_dev,
+-				dma->seg_addrs[idx] + off, to_sync, dir);
+-
+-		remaining -= to_sync;
+-		off = 0;
+-		idx++;
+-	}
++	blk_persistent_dma_sync(slot->dma, bio,
++		for_device ? BLK_DMA_SYNC_FOR_DEVICE : BLK_DMA_SYNC_FOR_CPU);
+ }
+ 
+ static void io_slot_done_inline(struct io_kiocb *req)
+@@ -233,7 +195,8 @@ static void io_free_io_slot(struct io_ring_ctx *ctx, struct io_slot *slot)
+ {
+ 	WARN_ON_ONCE(io_slot_busy(slot));
+ 
+-	io_buf_put_dma(slot->buf_node->buf, slot->dma);
++	blk_persistent_dma_unmap(slot->dma);
++	slot->dma = NULL;
+ 	bio_uninit(&slot->bio);
+ 	io_put_rsrc_node(ctx, slot->buf_node);
+ 	io_put_rsrc_node(ctx, slot->file_node);
+@@ -273,153 +236,20 @@ static struct block_device *io_slot_validate_file(struct file *file)
+ }
+ 
+ /*
+- * Refcounted (imu, dma_dev) DMA mapping. Slots referencing the same
+- * registered buffer + device share a single mapping; the first slot to
+- * register builds it, subsequent ones bump refs, and the last one to
+- * unregister tears it down. Chained on imu->dma_mappings.
+- */
+-struct io_buf_dma {
+-	struct io_slot_dma	dma;		/* embedded; slot->dma points here */
+-	struct device		*dma_dev;	/* key */
+-	refcount_t		refs;
+-	struct list_head	list;
+-};
+-
+-/*
+- * Build a persistent DMA mapping for the slot's registered buffer.
++ * Build or retrieve a persistent DMA mapping. The block layer handles
++ * refcounting across slots sharing the same (buffer, dma_dev) pair.
+  */
+-static int io_imu_dma_map(struct io_mapped_ubuf *imu, struct io_slot_dma *dma,
+-			  struct device *dma_dev)
++static struct blk_persistent_dma *io_buf_get_dma(struct io_mapped_ubuf *imu,
++						 struct request_queue *q)
+ {
+-	const enum dma_data_direction dir = DMA_BIDIRECTIONAL;
+-	size_t mapped = 0;
+-	unsigned int i;
++	struct blk_persistent_dma *dma;
+ 	int ret;
+ 
+-	dma->dma_dev = dma_dev;
+-	dma->dir = dir;
+-	dma->nr_segs = imu->nr_bvecs;
+-	dma->len = imu->len;
+-	dma->folio_shift = imu->folio_shift;
+-
+-	/* IOVA path: coalesce the whole buffer into a single IOVA range. */
+-	if (dma_iova_try_alloc(dma_dev, &dma->state,
+-			page_to_phys(imu->bvec[0].bv_page) +
+-				imu->bvec[0].bv_offset,
+-			imu->len)) {
+-		for (i = 0; i < imu->nr_bvecs; i++) {
+-			struct bio_vec *bv = &imu->bvec[i];
+-			phys_addr_t phys =
+-				page_to_phys(bv->bv_page) + bv->bv_offset;
+-
+-			ret = dma_iova_link(dma_dev, &dma->state, phys, mapped,
+-					    bv->bv_len, dir, 0);
+-			if (ret)
+-				goto unlink;
+-			mapped += bv->bv_len;
+-		}
+-		if (dma_iova_sync(dma_dev, &dma->state, 0, mapped)) {
+-			ret = -EIO;
+-			goto unlink;
+-		}
+-		return 0;
+-
+-unlink:
+-		while (i-- > 0) {
+-			mapped -= imu->bvec[i].bv_len;
+-			dma_iova_unlink(dma_dev, &dma->state, mapped,
+-					imu->bvec[i].bv_len, dir, 0);
+-		}
+-		dma_iova_free(dma_dev, &dma->state);
+-		return ret;
+-	}
+-
+-	/* Direct path: per-bvec dma_map_page. */
+-	dma->seg_addrs = kvmalloc_array(imu->nr_bvecs, sizeof(dma_addr_t),
+-					GFP_KERNEL_ACCOUNT);
+-	if (!dma->seg_addrs)
+-		return -ENOMEM;
+-	for (i = 0; i < imu->nr_bvecs; i++) {
+-		struct bio_vec *bv = &imu->bvec[i];
+-		dma_addr_t addr;
+-
+-		addr = dma_map_page(dma_dev, bv->bv_page, bv->bv_offset,
+-				    bv->bv_len, dir);
+-		if (dma_mapping_error(dma_dev, addr)) {
+-			while (i-- > 0)
+-				dma_unmap_page(dma_dev, dma->seg_addrs[i],
+-					imu->bvec[i].bv_len, dir);
+-			kvfree(dma->seg_addrs);
+-			return -ENOMEM;
+-		}
+-		dma->seg_addrs[i] = addr;
+-	}
+-	return 0;
+-}
+-
+-static void io_imu_dma_unmap(struct io_mapped_ubuf *imu, struct io_slot_dma *dma)
+-{
+-	unsigned int i;
+-
+-	if (dma_use_iova(&dma->state)) {
+-		dma_iova_destroy(dma->dma_dev, &dma->state, imu->len,
+-				 dma->dir, 0);
+-	} else {
+-		for (i = 0; i < dma->nr_segs; i++)
+-			dma_unmap_page(dma->dma_dev, dma->seg_addrs[i],
+-				       imu->bvec[i].bv_len, dma->dir);
+-		kvfree(dma->seg_addrs);
+-	}
+-}
+-
+-/*
+- * Look up an existing (imu, dma_dev) mapping or build a fresh one.
+- * Caller holds ctx->uring_lock so list mutation is serialised.
+- */
+-static struct io_slot_dma *io_buf_get_dma(struct io_mapped_ubuf *imu,
+-					  struct request_queue *q)
+-{
+-	struct device *dma_dev = q->dma_dev;
+-	struct io_buf_dma *bd;
+-	int ret;
+-
+-	list_for_each_entry(bd, &imu->dma_mappings, list) {
+-		if (bd->dma_dev == dma_dev) {
+-			refcount_inc(&bd->refs);
+-			return &bd->dma;
+-		}
+-	}
+-
+-	bd = kzalloc(sizeof(*bd), GFP_KERNEL_ACCOUNT);
+-	if (!bd)
+-		return ERR_PTR(-ENOMEM);
+-	ret = io_imu_dma_map(imu, &bd->dma, dma_dev);
+-	if (ret < 0) {
+-		kfree(bd);
++	ret = blk_persistent_dma_map(q, imu->bvec, imu->nr_bvecs,
++				     imu->folio_shift, imu->len, &dma);
++	if (ret < 0)
+ 		return ERR_PTR(ret);
+-	}
+-	bd->dma_dev = dma_dev;
+-	refcount_set(&bd->refs, 1);
+-	if (q->persistent_dma_setup)
+-		q->persistent_dma_setup(q, &bd->dma);
+-	list_add(&bd->list, &imu->dma_mappings);
+-	return &bd->dma;
+-}
+-
+-static void io_buf_put_dma(struct io_mapped_ubuf *imu, struct io_slot_dma *dma)
+-{
+-	struct io_buf_dma *bd;
+-
+-	if (!dma)
+-		return;
+-	bd = container_of(dma, struct io_buf_dma, dma);
+-	if (!refcount_dec_and_test(&bd->refs))
+-		return;
+-	list_del(&bd->list);
+-	if (dma->driver_priv_destroy)
+-		dma->driver_priv_destroy(dma);
+-	io_imu_dma_unmap(imu, &bd->dma);
+-	kfree(bd);
++	return dma;
+ }
+ 
+ int io_register_io_slot(struct io_ring_ctx *ctx, void __user *arg)
+@@ -505,7 +335,8 @@ int io_register_io_slot(struct io_ring_ctx *ctx, void __user *arg)
+ 		return slot_id;
+ 	}
+ 
+-	io_buf_put_dma(imu, slot->dma);
++	blk_persistent_dma_unmap(slot->dma);
++	slot->dma = NULL;
+ 	io_put_rsrc_node(ctx, file_node);
+ 	io_put_rsrc_node(ctx, buf_node);
+ 	bio_uninit(&slot->bio);
