@@ -1,0 +1,331 @@
+%% Registered IO Slots — Mermaid Overview
+%% Render at: https://mermaid.live or with mermaid-cli
+
+%% ===================================================================
+%% 1. REGISTRATION SEQUENCE
+%% ===================================================================
+sequenceDiagram
+    participant U as Userspace
+    participant IO as io_uring
+    participant BLK as Block Layer
+    participant DMA as DMA API
+    participant NVMe as NVMe Driver
+    participant HW as NVMe Controller
+
+    U->>IO: io_uring_register(IO_SLOT, &reg)
+    activate IO
+
+    IO->>IO: validate slot_id, buf_ring, file_fd
+    IO->>IO: alloc io_io_slot (slot_cache)
+
+    IO->>IO: io_slot_alloc_bio()
+    Note over IO: slot->bio.bi_io_vec = imu->bvec[]
+
+    IO->>IO: io_buf_get_dma(imu, q)
+
+    alt existing mapping for (imu, dev)
+        IO->>IO: refcount_inc, reuse existing
+    else new mapping
+        IO->>DMA: io_imu_dma_map()
+        Note over DMA,IO: build SG list from imu->bvec[]
+
+        DMA->>DMA: dma_map_sg(dev, sg, nents, dir)
+
+        alt IOMMU coalesced (returned 1 entry)
+            Note over DMA: dma->use_iova = true<br/>dma->state.addr = sg_dma_address
+        else no IOMMU / can't coalesce
+            loop each bvec
+                DMA->>DMA: dma_map_page()
+            end
+            Note over DMA: dma->use_iova = false<br/>dma->seg_addrs[] = mapped addrs
+        end
+
+        IO->>NVMe: q->persistent_dma_setup(q, dma)
+        activate NVMe
+
+        NVMe->>NVMe: nvme_pci_persistent_dma_setup()
+        Note over NVMe: skip if IOVA or nr_segs > 1
+
+        alt needs PRP list
+            NVMe->>DMA: dma_alloc_coherent() × N pages
+            Note over NVMe: fill PRP list entries<br/>chain pages together
+            Note over NVMe: dma->driver_priv = ppp
+        end
+
+        NVMe-->>IO: return 0
+        deactivate NVMe
+    end
+
+    Note over IO: slot->bio.bi_private = slot->dma
+    IO->>IO: ctx->io_slots[slot_id] = slot
+    IO-->>U: return 0 (success)
+    deactivate IO
+
+%% ===================================================================
+%% 2. FAST IO PATH (per-IO submission)
+%% ===================================================================
+pageBreak
+
+sequenceDiagram
+    participant U as Userspace
+    participant IO as io_uring
+    participant BLK as Block Layer
+    participant NVMe as NVMe Driver
+    participant HW as NVMe Controller
+
+    U->>IO: SQE: IORING_OP_SLOT_RW (slot_id, offset, len)
+    activate IO
+
+    IO->>IO: io_slot_rw_prep()
+    Note over IO: lookup slot from ctx->io_slots[]
+
+    IO->>IO: io_slot_rw_issue()
+    Note over IO: slot->busy = 1 (atomic)
+
+    IO->>IO: configure slot->bio
+    Note over IO: bi_sector = (file_off + buf_off) >> 9<br/>bi_size = len<br/>bi_opf = OP | BIO_REGISTERED | IOCB_IOPOLL
+
+    IO->>BLK: submit_bio_noacct_fast(&slot->bio, q)
+    deactivate IO
+
+    activate BLK
+    BLK->>BLK: blk_mq_submit_bio()
+    Note over BLK: bio→req: BIO_REGISTERED → RQF_REGISTERED
+
+    BLK->>NVMe: nvme_queue_rq()
+    deactivate BLK
+    activate NVMe
+
+    NVMe->>NVMe: nvme_map_data(req)
+
+    NVMe->>NVMe: nvme_pci_setup_data_registered(req)
+    Note over NVMe: dma = bio_persistent_dma(bio)
+
+    alt IOVA path
+        Note over NVMe: dma_addr = dma->state.addr<br/>          + blk_persistent_dma_buf_offset(dma, bio)
+    else direct, single segment
+        Note over NVMe: dma_addr = dma->seg_addrs[0]<br/>          + bio->bi_iter.bi_bvec_done
+    else multi-segment direct
+        Note over NVMe: return BLK_STS_AGAIN → fallback
+    end
+
+    alt ≤2 NVMe pages
+        Note over NVMe: PRP1 = cpu_to_le64(dma_addr)<br/>PRP2 = 0 or dma_addr + first_prp_len<br/>── NO DMA MAPS ──
+    else >2 pages + SGL capable
+        Note over NVMe: SGL descriptor:<br/>sgl.addr = cpu_to_le64(dma_addr)<br/>sgl.length = cpu_to_le32(total)<br/>── NO DMA MAPS ──
+    else >2 pages + PRP-only + list exists
+        Note over NVMe: PRP1 = cpu_to_le64(dma_addr)<br/>PRP2 = nvme_pci_persistent_prp_ptr()<br/>── NO DMA MAPS ──
+    else fallback
+        Note over NVMe: clear RQF_REGISTERED<br/>normal dma_map per page
+    end
+
+    NVMe->>NVMe: build NVMe command in SQ entry
+    NVMe->>HW: ring SQ doorbell
+    deactivate NVMe
+
+%% ===================================================================
+%% 3. COMPLETION PATH
+%% ===================================================================
+pageBreak
+
+sequenceDiagram
+    participant HW as NVMe Controller
+    participant NVMe as NVMe Driver
+    participant BLK as Block Layer
+    participant IO as io_uring
+    participant U as Userspace
+
+    HW->>NVMe: CQE in CQ (MSI-X or iopoll)
+    activate NVMe
+
+    NVMe->>NVMe: nvme_pci_complete_rq()
+
+    alt RQF_REGISTERED set
+        Note over NVMe: SKIP dma_unmap<br/>(mapping lives in slot)
+    else normal IO
+        NVMe->>NVMe: nvme_unmap_data()<br/>dma_unmap_page() × N
+    end
+
+    NVMe->>BLK: blk_mq_end_request()
+    deactivate NVMe
+
+    BLK->>IO: completion callback
+    deactivate BLK
+
+    Note over IO: slot->busy = 0
+
+    IO->>U: CQE in userspace CQ
+    deactivate IO
+
+%% ===================================================================
+%% 4. TEARDOWN PATH
+%% ===================================================================
+pageBreak
+
+sequenceDiagram
+    participant U as Userspace
+    participant IO as io_uring
+    participant NVMe as NVMe Driver
+    participant DMA as DMA API
+
+    U->>IO: io_uring_register(UNREGISTER_IO_SLOT, &slot_id)
+    activate IO
+
+    IO->>IO: io_free_io_slot(slot)
+
+    IO->>IO: io_buf_put_dma(slot->dma)
+    Note over IO: refcount_dec_and_test()
+
+    alt refs == 0
+        IO->>NVMe: dma->driver_priv_destroy(dma)
+        activate NVMe
+        NVMe->>NVMe: nvme_pci_persistent_dma_destroy()
+        Note over NVMe: dma_free_coherent() × N pages
+        NVMe-->>IO: done
+        deactivate NVMe
+
+        IO->>DMA: io_imu_dma_unmap()
+        alt IOVA path
+            DMA->>DMA: dma_unmap_sg()
+        else direct path
+            loop nr_segs
+                DMA->>DMA: dma_unmap_page()
+            end
+        end
+
+        IO->>IO: kfree(bd)
+    end
+
+    IO->>IO: fput(slot->file)
+    IO->>IO: io_put_rsrc_node(slot->imu)
+    IO->>IO: kmem_cache_free(slot_cache, slot)
+    Note over IO: ctx->io_slots[slot_id] = NULL
+
+    IO-->>U: return 0
+    deactivate IO
+
+%% ===================================================================
+%% 5. DMA CALLS COMPARISON
+%% ===================================================================
+pageBreak
+
+block-beta
+    columns 3
+
+    block:normal_group:1
+        columns 1
+        title["Normal IO (per-IO)"]
+        style title fill:#fbb,stroke:#a00
+        N1["Allocate bio"]
+        N2["dma_map_page() × N"]
+        N3["Build PRP list"]
+        N4["Submit to HW"]
+        N5["Complete"]
+        N6["dma_unmap_page() × N"]
+        N7["Free bio + PRP list"]
+    end
+
+    block:spacer:1
+        style spacer fill:transparent,stroke:transparent
+        S[" "]
+    end
+
+    block:slot_group:1
+        columns 1
+        title["Registered Slot IO"]
+        style title fill:#bfb,stroke:#0a0
+        S1["Embedded bio (slot->bio)"]
+        S2["0 dma_map calls"]
+        S3["0 PRP alloc (precomputed)"]
+        S4["Submit to HW"]
+        S5["Complete"]
+        S6["0 dma_unmap calls"]
+        S7["0 bio free (reused)"]
+    end
+
+    normal_group --> slot_group : "X per IO"
+
+%% ===================================================================
+%% 6. FULL LAYER STACK
+%% ===================================================================
+pageBreak
+
+flowchart TB
+    subgraph Userspace["Userspace"]
+        direction LR
+        APP["Application"]
+        LIB["liburing"]
+    end
+
+    subgraph IO_URING["io_uring (kernel)"]
+        direction TB
+        REG["io_register_io_slot()"]
+        SUBMIT["io_slot_rw_issue()"]
+        SLOT["struct io_io_slot"]
+        BIO["slot->bio (embedded)"]
+        REQ["slot->req (pre-alloc kiocb)"]
+        DMA["slot->dma (blk_persistent_dma)"]
+    end
+
+    subgraph BLOCK["Block Layer"]
+        direction TB
+        FASTPATH["submit_bio_noacct_fast()"]
+        BLKMQ["blk_mq_submit_bio()"]
+        FLAG["BIO_REGISTERED → RQF_REGISTERED"]
+        Q["request_queue { dma_dev, persistent_dma_setup }"]
+    end
+
+    subgraph NVME_DRIVER["NVMe Driver (pci.c)"]
+        direction TB
+        REG_PATH["nvme_pci_persistent_dma_setup()"]
+        FAST_IO["nvme_pci_setup_data_registered()"]
+        PRP_PTR["nvme_pci_persistent_prp_ptr()"]
+        UNMAP["nvme_unmap_data()"]
+        IOVA["IOVA / Direct DMA address"]
+    end
+
+    subgraph HW["NVMe Controller"]
+        direction LR
+        SQ["Submission Queue"]
+        CQ["Completion Queue"]
+        DMA_ENG["DMA Engine"]
+    end
+
+    APP -->|io_uring_enter| LIB
+    LIB -->|SQE: SLOT_RW| SUBMIT
+    LIB -->|register| REG
+
+    REG --> SLOT
+    SLOT --> BIO
+    SLOT --> REQ
+    SLOT --> DMA
+    REG -->|io_buf_get_dma| FASTPATH
+
+    SUBMIT -->|submit_bio_noacct_fast| BLOCK
+
+    BLOCK -->|bio| BLKMQ
+    BLKMQ --> FLAG
+    FLAG -->|RQF_REGISTERED| NVME_DRIVER
+
+    Q -->|q->dma_dev| DMA
+    Q -->|q->persistent_dma_setup| REG_PATH
+
+    REG_PATH -->|dma_alloc_coherent| PRP_PTR
+    REG_PATH -->|dma->driver_priv| DMA
+
+    FAST_IO -->|bio_persistent_dma()| DMA
+    FAST_IO -->|PRP1/PRP2| SQ
+
+    IOVA -.->|dma_addr| FAST_IO
+    PRP_PTR -.->|PRP2 address| FAST_IO
+
+    SQ -.->|PCIe TLP| DMA_ENG
+    DMA_ENG -->|data| SYSTEM_MEM["Host Memory"]
+    DMA_ENG -->|completion| CQ
+
+    UNMAP -.->|RQF_REGISTERED? skip| FAST_IO
+
+    style DMA fill:#bfb,stroke:#0a0
+    style FAST_IO fill:#bfb,stroke:#0a0
+    style REG_PATH fill:#bbf,stroke:#00a
+    style PRP_PTR fill:#bbf,stroke:#00a

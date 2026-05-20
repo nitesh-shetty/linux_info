@@ -1,0 +1,346 @@
+Registered IO Slots — Data Flow Overview
+=========================================
+
+  1. REGISTRATION PATH (one-time setup)
+  2. FAST IO PATH (per-IO, no dma_map)
+  3. FALLBACK PATH (per-IO with dma_map)
+  4. COMPLETION PATH (per-IO)
+  5. TEARDOWN PATH (one-time cleanup)
+
+
+======================================================================
+1. REGISTRATION PATH
+======================================================================
+
+  Userspace:  io_uring_register(ctx, IORING_REGISTER_IO_SLOT, &slot_reg)
+
+      │
+      ▼
+  io_register_io_slot()
+      │
+      ├── Validate slot_id, buf_ring_fd, file_fd
+      │
+      ├── Get io_mapped_ubuf (imu) from buffer ring
+      │   └── imu->bvec[] describes the virtual memory layout
+      │
+      ├── Get block device file → bdev → request_queue
+      │
+      ├── Allocate struct io_io_slot (slot_cache)
+      │   ├── slot->file       = bdev_file
+      │   ├── slot->imu        = imu
+      │   ├── slot->slot_id    = id
+      │   ├── slot->req        = embedded kiocb (REQ_F_IOPOLL set)
+      │   └── slot->bio        = embedded bio
+      │
+      ├── io_slot_alloc_bio()
+      │   └── slot->bio.bi_io_vec = imu->bvec[]   ◄── reuse buffer pages
+      │
+      ├── io_buf_get_dma(imu, q)
+      │   │
+      │   ├── Walk imu->dma_mappings for existing (same buf, same dev)
+      │   │   └── Found? → refcount_inc, return existing dma
+      │   │
+      │   ├── io_imu_dma_map()                       ◄── DMA MAP (once)
+      │   │   │
+      │   │   ├── BUILD SG LIST from imu->bvec[]
+      │   │   │
+      │   │   ├── dma_map_sg(dev, sg, nents, dir)    ◄── HW call
+      │   │   │   │
+      │   │   │   ├── IOMMU coalesced? (returned 1 entry)
+      │   │   │   │   └── dma->use_iova = true
+      │   │   │   │       dma->state.addr = sg_dma_address(sg)
+      │   │   │   │
+      │   │   │   └── No IOMMU / can't coalesce (returned >1)
+      │   │   │       └── dma->use_iova = false
+      │   │   │           for each bvec: dma_map_page()
+      │   │   │           dma->seg_addrs[] = mapped addresses
+      │   │   │           dma->nr_segs = # of segments
+      │   │   │
+      │   │   └── dma->folio_shift = imu->folio_shift
+      │   │       dma->len         = imu->len
+      │   │       dma->dma_dev     = dev
+      │   │       dma->dir         = dir
+      │   │
+      │   └── q->persistent_dma_setup(q, dma)         ◄── DRIVER HOOK
+      │       │
+      │       └── nvme_pci_persistent_dma_setup()
+      │           │  (skip if IOVA or nr_segs > 1)
+      │           │
+      │           ├── Compute total pages needed
+      │           ├── nr_prps = total_pages - 1  (PRP1 covers page 0)
+      │           │
+      │           ├── dma_alloc_coherent() × N pages  ◄── PRP list pages
+      │           ├── Fill PRP entries: list[i] = page_base + (i+1)*4K
+      │           ├── Chain pages: last entry → next page DMA addr
+      │           │
+      │           └── dma->driver_priv = ppp
+      │               dma->driver_priv_destroy = nvme_pci_persistent_dma_destroy
+      │
+      └── slot->dma = &bd->dma
+          slot->bio.bi_private = slot->dma   ◄── for bio_persistent_dma()
+
+      │
+      ▼
+  ctx->io_slots[slot_id] = slot
+
+
+======================================================================
+2. FAST IO PATH (per-IO submission, no dma_map)
+======================================================================
+
+  Userspace:  SQE with IORING_OP_SLOT_RW
+              (slot_id, offset, len, rw_flags)
+
+      │
+      ▼
+  io_slot_rw_prep()
+      ├── Read SQE: slot_id, rw_flags, buf_offset, bytes
+      ├── ctx->io_slots[slot_id] → slot
+      └── Store slot + offset in req->async_data
+
+      │
+      ▼
+  io_slot_rw_issue()
+      ├── slot->busy = 1 (atomic test_and_set)
+      │
+      ├── Configure slot->bio:
+      │   ├── bi_iter.bi_sector = (file_offset + buf_offset) >> 9
+      │   ├── bi_iter.bi_size   = bytes
+      │   └── bi_opf = REQ_OP_READ|WRITE | BIO_REGISTERED | IOCB_IOPOLL
+      │
+      ├── submit_bio_noacct_fast(&slot->bio, q)
+      │   │
+      │   ▼
+      │   blk_mq_submit_bio(bio)
+      │       │
+      │       ├── blk_mq_bio_to_request()
+      │       │   └── BIO_REGISTERED → RQF_REGISTERED (on req->rq_flags)
+      │       │
+      │       └── → nvme_queue_rq()
+      │           │
+      │           ▼
+      │       nvme_map_data(req)
+      │           │
+      │           ├── nvme_pci_setup_data_registered(req)    ◄── TRY FAST PATH
+      │           │   │
+      │           │   ├── dma = bio_persistent_dma(bio)
+      │           │   │       = slot->bio.bi_private
+      │           │   │       = struct blk_persistent_dma *
+      │           │   │
+      │           │   ├── Get DMA address:
+      │           │   │   │
+      │           │   │   ├── IOVA path:
+      │           │   │   │   dma_addr = dma->state.addr
+      │           │   │   │           + blk_persistent_dma_buf_offset(dma, bio)
+      │           │   │   │
+      │           │   │   └── Direct, single segment:
+      │           │   │       dma_addr = dma->seg_addrs[0]
+      │           │   │               + bio->bi_iter.bi_bvec_done
+      │           │   │
+      │           │   ├── ≤2 NVMe pages?
+      │           │   │   └── PRP1 = dma_addr
+      │           │   │       PRP2 = 0 or dma_addr + first_prp_len
+      │           │   │       ──── NO DMA MAP CALLS ────
+      │           │   │
+      │           │   ├── >2 pages + SGL capable?
+      │           │   │   └── SGL descriptor:
+      │           │   │       sgl.addr  = cpu_to_le64(dma_addr)
+      │           │   │       sgl.length = cpu_to_le32(total)
+      │           │   │       sgl.type  = NVME_SGL_FMT_DATA_DESC << 4
+      │           │   │       ──── NO DMA MAP CALLS ────
+      │           │   │
+      │           │   ├── >2 pages + PRP-only + PRP list exists?
+      │           │   │   └── PRP1 = dma_addr
+      │           │   │       PRP2 = nvme_pci_persistent_prp_ptr()
+      │           │   │            → walks precomputed list
+      │           │   │            → returns DMA addr of PRP entry
+      │           │   │       ──── NO DMA MAP CALLS ────
+      │           │   │
+      │           │   └── Else → BLK_STS_AGAIN
+      │           │
+      │           └── ret == BLK_STS_AGAIN?
+      │               └── go to FALLBACK PATH (section 3)
+      │
+      └── Return to io_uring (IO in flight, will be iopolled)
+
+
+======================================================================
+3. FALLBACK PATH (when BLK_STS_AGAIN)
+======================================================================
+
+  nvme_map_data()
+      │
+      ├── nvme_pci_setup_data_registered() returned BLK_STS_AGAIN
+      │   (multi-segment direct path, or PRP-only + too large + no list)
+      │
+      ├── req->rq_flags &= ~RQF_REGISTERED
+      │   (so completion does normal dma_unmap)
+      │
+      └── Normal dma_map path:
+          blk_rq_dma_map_iter_walk()
+              for each page in bio:
+                  dma_map_page(dev, page, offset, len, dir)
+                  build PRP/SGL entry
+          ──── ONE DMA MAP PER PAGE ────
+
+
+======================================================================
+4. COMPLETION PATH (per-IO)
+======================================================================
+
+  NVMe CQE arrives (interrupt or iopoll)
+
+      │
+      ▼
+  nvme_pci_complete_rq()  or  nvme_complete_batch()
+
+      │
+      ├── RQF_REGISTERED set?
+      │   ├── Yes → SKIP dma_unmap (mapping belongs to slot, not request)
+      │   └── No  → nvme_unmap_data(): dma_unmap_page() per segment
+      │
+      ├── blk_mq_end_request() / bio_endio()
+      │
+      └── slot->busy = 0
+
+      │
+      ▼
+  (Userspace gets CQE with result)
+
+
+======================================================================
+5. TEARDOWN PATH (slot unregistration)
+======================================================================
+
+  Userspace:  io_uring_register(ctx, IORING_UNREGISTER_IO_SLOT, &slot_id)
+
+      │
+      ▼
+  io_free_io_slot(slot)
+      │
+      ├── io_buf_put_dma(slot->dma)
+      │   │
+      │   ├── refcount_dec_and_test()
+      │   │   └── refs == 0? (no other slot shares this mapping)
+      │   │
+      │   ├── dma->driver_priv_destroy(dma)           ◄── DRIVER HOOK
+      │   │   └── nvme_pci_persistent_dma_destroy()
+      │   │       └── dma_free_coherent() × N pages   ◄── free PRP list
+      │   │
+      │   ├── io_imu_dma_unmap()                       ◄── DMA UNMAP (once)
+      │   │   ├── dma_unmap_sg()   (IOVA path)
+      │   │   └── dma_unmap_page() × nr_segs (direct path)
+      │   │
+      │   └── kfree(bd)
+      │
+      ├── fput(slot->file)
+      ├── io_put_rsrc_node(slot->imu)
+      └── kmem_cache_free(slot_cache, slot)
+          ctx->io_slots[slot_id] = NULL
+
+
+======================================================================
+KEY: Zero dma_map/dma_unmap per IO
+======================================================================
+
+                    Normal IO                  Registered Slot IO
+                    ─────────                  ─────────────────
+
+  Registration:    N/A                        dma_map_sg / dma_map_page (ONCE)
+                                              dma_alloc_coherent for PRP list (ONCE)
+
+  Per IO submit:   dma_map_page × N           None (uses precomputed address)
+                   allocate PRP list
+                   fill PRP entries
+
+  Per IO complete: dma_unmap_page × N         None (mapping lives in slot)
+                   free PRP list
+
+  Unregistration:  N/A                        dma_unmap_sg / dma_unmap_page (ONCE)
+                                              dma_free_coherent for PRP list (ONCE)
+
+  Savings:         -                          • 0 dma_map/dma_unmap per IO
+                                              • 0 PRP list alloc/free per IO
+                                              • 0 page-table walks per IO
+                                              • 0 bio allocation per IO
+                                              • 0 io_kiocb allocation per IO
+
+
+======================================================================
+LAYER DIAGRAM
+======================================================================
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    Userspace                                │
+  │  io_uring_register(IO_SLOT)      io_uring_enter(SLOT_RW)   │
+  └──────────┬──────────────────────────────┬──────────────────┘
+             │                              │
+             ▼                              ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    io_uring (kernel)                        │
+  │                                                             │
+  │  io_register_io_slot()             io_slot_rw_issue()       │
+  │    ├─ io_slot_alloc_bio()            ├─ slot->busy = 1     │
+  │    └─ io_buf_get_dma()              └─ submit_bio_fast()   │
+  │         └─ io_imu_dma_map()              │                  │
+  │              └─ dma_map_sg()              │                  │
+  │                                           │                  │
+  │  struct io_io_slot {                      │                  │
+  │    struct bio bio;        ◄───── embedded bio ──────────────┘
+  │    struct io_kiocb req;   ◄───── pre-allocated kiocb
+  │    struct blk_persistent_dma *dma; ◄────── persistent DMA
+  │  }                                        │
+  └───────────────────────────────────────────┼──────────────────
+                                              │
+                                              ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │                 Block Layer                                 │
+  │                                                             │
+  │  submit_bio_noacct_fast()                                   │
+  │    └─ blk_mq_submit_bio()                                   │
+  │         └─ blk_mq_bio_to_request()                          │
+  │              └─ BIO_REGISTERED → RQF_REGISTERED             │
+  │                                                             │
+  │  request_queue {                                            │
+  │    struct device *dma_dev;           ◄──── (from driver)    │
+  │    (*persistent_dma_setup)(q, dma); ◄──── (driver hook)     │
+  │  }                                                          │
+  └─────────────────────────────────────────────────────────────┘
+                                              │
+                                              ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │              NVMe Driver (pci.c)                             │
+  │                                                             │
+  │  nvme_queue_rq()                                             │
+  │    └─ nvme_map_data()                                       │
+  │         ├─ nvme_pci_setup_data_registered()  ◄── FAST PATH  │
+  │         │   ├─ bio_persistent_dma(bio) → dma                │
+  │         │   ├─ dma_addr = dma->state.addr ...               │
+  │         │   ├─ SGL?  → single SGL desc                      │
+  │         │   ├─ PRP?  → PRP1 + PRP2 in precomputed list      │
+  │         │   └─ return OK                                    │
+  │         │                                                   │
+  │         └─ BLK_STS_AGAIN? → normal dma_map path  ◄── SLOW   │
+  │                                                             │
+  │  nvme_pci_persistent_dma_setup()    ◄── builds PRP list     │
+  │    └─ dma_alloc_coherent() × N                              │
+  │                                                             │
+  │  nvme_unmap_data()                                          │
+  │    └─ RQF_REGISTERED? → skip (fast)                         │
+  │       else → dma_unmap_page() × N (slow)                    │
+  └─────────────────────────────────────────────────────────────┘
+                                              │
+                                              ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    NVMe Controller (HW)                      │
+  │                                                             │
+  │  Reads PRP/SGL from SQ entry (in PCIe BAR)                  │
+  │    ├─ PRP1 → data buffer page 0  (from SQE)                 │
+  │    ├─ PRP2 → data buffer page 1  (from SQE, or precomp'd)   │
+  │    └─ PRP list → pages 2+        (from coherent DMA memory) │
+  │                                                             │
+  │  Performs PCIe DMA directly to/from host memory             │
+  │  (IOMMU translates if enabled)                              │
+  │                                                             │
+  │  Completes → CQE in CQ (MSI-X interrupt or iopoll)          │
+  └─────────────────────────────────────────────────────────────┘
