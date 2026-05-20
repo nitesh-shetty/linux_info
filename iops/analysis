@@ -1,0 +1,1138 @@
+Registered IO Slots — Patch-by-Patch Analysis (Full Detail)
+===========================================================
+Series: io_uring registered IO slots (IOMMU-bypassing zero-copy IO)
+17 patches, analyzed bottom-up (first-applied = patch 17, last-applied = patch 1)
+
+================================================================================
+Patch 17: 480fa1e04c47 — "io_uring: lift REQ_F_IOPOLL set out of issue path"
+================================================================================
+
+This patch moves the setting of REQ_F_IOPOLL from io_issue_sqe() (where it used
+to be set per-op based on def->iopoll) up into io_init_req() so it happens before
+submit_bio.
+
+Why: registered slot IOs need REQ_F_IOPOLL set on the request before the bio is
+submitted. The IOPOLL completion path must be selected at submission time, not
+after. The slot's pre-allocated kiocb (slot->req) has REQ_F_IOPOLL set directly
+at allocation time. For the ->prep handler to set it, the flag must already be
+available on the request.
+
+The commit also renames io_init_req to do_init_req because it becomes a helper
+called from a new io_init_req wrapper that handles the allocation + init. The
+new io_init_req additionally does the IOPOLL flag setting:
+
+  static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
+                         const struct io_uring_sqe *sqe, unsigned int *left)
+          __must_hold(&ctx->uring_lock)
+  {
+          ...
+
+          if (def->iopoll) {
+                  req->flags |= REQ_F_IOPOLL;
+                  ...
+          }
+          ...
+  }
+
+Previously this was in io_issue_sqe:
+
+  static int io_issue_sqe(struct io_kiocb *req, unsigned int issue_flags)
+  {
+          ...
+          if (def->iopoll)
+                  req->flags |= REQ_F_IOPOLL;
+          ...
+  }
+
+The diff also showed a timer_shutdown_sync pinning pattern — the author first
+stashed an integer in a variable, then did the actual timer_shutdown_sync call,
+and the variable is used after the call (keeps it alive via referencing).
+
+================================================================================
+Patch 16: 5195f8a41928 — "io_uring: check def->plug separately from needing file"
+================================================================================
+
+Separation of concerns: the old code used def->needs_file as a proxy for needing
+plugging. Since slot IOs don't need a file but do need plugging, these two
+concepts need to be independent.
+
+Before this patch, the plugging logic was tied to needs_file:
+
+  if (def->needs_file) {
+          // plugging logic
+  }
+
+After, they are split into two separate checks:
+
+  if (def->plug) {
+          // plugging logic
+  }
+  if (def->needs_file) {
+          // file handling logic
+  }
+
+Slot IOs (IORING_OP_SLOT_RW) set .plug = true but .needs_file = false.
+Normal read/write IOs have both .plug = true and .needs_file = true.
+
+================================================================================
+Patch 15: ff4208c36eef — "io_uring: factor out io_imu_offset_to_bvec() helper"
+================================================================================
+
+Extracts the offset-to-bvec lookup from the existing registered-buffer read/write
+path into a reusable helper. The helper io_imu_offset_to_bvec() is defined as:
+
+  bool io_imu_offset_to_bvec(struct io_mapped_ubuf *imu, loff_t offset,
+                             struct bio_vec *bvec, unsigned long *b_off)
+
+This answers: "given a byte offset within a registered buffer (struct
+io_mapped_ubuf), which page (bvec) does it land on, and what's the offset
+within that page?"
+
+The struct io_mapped_ubuf represents a pre-registered buffer ring. It has
+nr_bvecs entries, each describing a physically-contiguous chunk. All bvecs
+have the same folio_shift (enforced at registration time by io_provide_buffers
+or the buffer ring registration code — it rejects mixed folio sizes).
+
+The helper is a page-table walk: it divides the offset by the folio size to
+find the right bvec index, subtracts the prior bvecs' total size, and returns
+the page pointer + offset within it.
+
+Used by slot.c to translate the bio byte offset into a DMA-able page for the
+persistent DMA mapping. Without this, the slot code would need to duplicate
+the registered-buffer page-walk logic.
+
+================================================================================
+Patch 14: 35b9e7072c10 — "block: add submit_bio_noacct_fast and BIO_REGISTERED"
+================================================================================
+
+Two key additions to the block layer:
+
+1. submit_bio_noacct_fast():
+   A simplified bio submission path that bypasses most of the normal bio
+   plumbing. For slot IOs, all the validation was already done at registration
+   time, so we don't need to recheck things.
+
+   The normal path submit_bio_noacct() does:
+     - ->make_override (for things like dm/md)
+     - cgroup tracking (blkcg)
+     - bio_integrity_prep
+     - bio_advance()/bio_trim() checks
+     - various other checks
+
+   The fast path submit_bio_noacct_fast() does:
+     if (blk_queue_enter(q, flags) == 0)    // prevent queue removal
+         blk_mq_submit_bio(bio)              // straight to the driver
+
+   The function signature is:
+     void submit_bio_noacct_fast(struct bio *bio, struct request_queue *q)
+
+   Note that q is passed explicitly (not bio->bi_bdev->bd_queue) because the
+   slot already knows the queue from registration time.
+
+2. BIO_REGISTERED flag:
+   A new bio->bi_opf flag: REQ_BIO_REGISTERED (0x200000000). This marks a bio
+   as originating from a registered IO slot. It is set in io_slot_rw_issue()
+   when configuring the slot bio:
+
+     slot->bio.bi_opf = REQ_OP_READ | REQ_BIO_REGISTERED | REQ_IOCB_IOPOLL;
+
+   The flag is used by:
+     - The NVMe driver to select the fast DMA path (patch 5)
+     - The block layer to propagate to RQF_REGISTERED on the request (patch 6)
+
+3. Bio embedding:
+   The slot embeds its bio directly (struct bio bio; in struct io_io_slot)
+   rather than allocating one per IO. The bio's bvec array (bi_inline_vecs or
+   the preallocated bi_io_vec pointing to imu->bvec) is set up once at
+   registration time and reused for every IO on that slot.
+
+   Per-IO submission only adjusts:
+     - bi_iter.bi_sector (device offset)
+     - bi_iter.bi_size (transfer length)
+     - bi_opf (read/write + flags)
+
+   The bi_io_vec entries stay the same — they always point to the registered
+   buffer pages.
+
+================================================================================
+Patch 13: fb4cde303c4d — "io_uring: add IORING_OP_SLOT_RW and wire up submit path"
+================================================================================
+
+Adds IORING_OP_SLOT_RW, the actual IO opcode for registered slot operations.
+
+io_slot_rw_prep() — the prep handler (called during submission prep phase):
+  - Reads the SQE fields: slot_id, rw_flags (read/write), buf_offset, bytes,
+    and possibly a submit_offset (for concurrent IO)
+  - Validates the slot exists (ctx->io_slots[slot_id] != NULL) and is active
+    (slot->file != NULL)
+  - Checks that the block device is opened for the right mode (read vs write)
+  - If req->async_data is large enough, stores the slot pointer and offset there
+    (avoids per-IO memory allocation — the io_kiocb already has async_data space)
+
+io_slot_rw_issue() — the issue handler (called to actually submit the IO):
+  - Sets bi_iter.bi_sector = offset into the device (computed from the file
+    offset, not the buffer offset)
+  - Sets bi_iter.bi_size = transfer length
+  - Sets bi_opf = REQ_OP_READ/WRITE | BIO_REGISTERED | IOCB_IOPOLL
+  - Calls submit_bio_noacct_fast() to submit
+  - For iopoll, does NOT take uring_lock (unlike normal IO path)
+
+The fact that it doesn't take uring_lock for iopoll is important: the slot
+guarantees that only one IO is in flight at a time (via the slot->busy flag),
+so there's no concurrency to protect against. The slot->busy flag acts as the
+synchronization point instead.
+
+The issue handler also handles the case where a slot IO needs an overflow bio
+(see patch 10) — if the slot is already busy with an in-flight IO, a new
+overflow bio is allocated and linked.
+
+Slot IOs don't auto-plug (no request allocation needed since the slot has a
+pre-allocated req). The slot->req is a struct io_kiocb embedded in the slot,
+allocated from a dedicated kmem_cache (slot_cache). It has REQ_F_IOPOLL set
+at allocation time. This is the "stack-allocated kiocb" concept — it lives
+for the lifetime of the slot, not per-IO.
+
+================================================================================
+Patch 12: 45fb9c612e31 — "io_uring: add support for registered io slots"
+================================================================================
+
+The core slot registration infrastructure. This is where the main data
+structures and the registration ioctl are defined.
+
+io_register_io_slot() — the IORING_REGISTER_IO_SLOT handler:
+
+  1. Copies struct io_uring_io_slot_reg from userspace:
+     struct io_uring_io_slot_reg {
+         __u16 slot_id;
+         __u16 rw_flags;            // read or write
+         __s32 buf_ring_fd;         // fd of the registered buffer ring
+         __u32 buf_ring_offset;     // offset into the buffer ring
+         __s32 file_fd;             // fd of the block device
+         __u64 __rsrvd[2];
+     };
+
+  2. Validates:
+     - slot_id is in range [0, ctx->nr_io_slots)
+     - ctx->io_slots[slot_id] is not already registered
+     - buf_ring_fd refers to a valid registered buffer ring
+     - file_fd refers to a valid block device file opened O_DIRECT
+     - The buffer ring has enough space for the slot
+
+  3. Gets or creates the io_mapped_ubuf (imu) for the buffer ring. The imu
+     describes the pre-registered buffer's page layout (nr_bvecs bvec entries,
+     total length, folio_shift, etc.)
+
+  4. Gets the file and its bdev (block device) from file_fd
+
+  5. Allocates struct io_io_slot, fills it in, stores in ctx->io_slots[slot_id]
+
+  6. Calls io_slot_alloc_bio() to set up slot->bio
+
+  7. Calls io_buf_get_dma() to create the persistent DMA mapping
+
+struct io_io_slot — the per-slot data structure (internal to slot.c):
+
+  struct io_io_slot {
+      struct file          *file;         // bdev file from registration
+      struct io_mapped_ubuf *imu;         // registered buffer (the backing pages)
+      struct bio           bio;           // embedded bio, reused per IO
+      struct io_slot_dma   *dma;          // persistent DMA mapping
+      struct io_kiocb      req;           // pre-allocated kiocb
+      int                  slot_id;       // index into ctx->io_slots[]
+      unsigned int         nr_bvec;       // number of bvec entries
+      atomic_t             busy;          // 1 = IO in flight, 0 = idle
+  };
+
+The busy flag semantics:
+  - atomically set to 1 at submission time (test_and_set)
+  - atomically cleared to 0 at completion time
+  - Prevents concurrent submissions to the same slot
+  - Also used as the signal for "need to allocate overflow bio" — if busy was
+    already 1 when trying to submit, allocate an overflow bio instead of failing
+
+io_slot_alloc_bio() — initializes the slot's embedded bio:
+
+  slot->bio.bi_io_vec = imu->bvec;        // reuse the registered buffer's bvec
+  slot->bio.bi_vcnt = imu->nr_bvecs;
+  slot->bio.bi_max_vecs = imu->nr_bvecs;
+  bio_set_dev(&slot->bio, bdev);          // associate with the block device
+  slot->bio.bi_private = dma;             // for bio_persistent_dma()
+
+The slab cache for slots:
+
+  static struct kmem_cache *slot_cache;
+  // allocated at module init via:
+  // slot_cache = KMEM_CACHE(io_io_slot, SLAB_HWCACHE_ALIGN | SLAB_PANIC);
+
+Slot unregistration (io_free_io_slot):
+  - io_buf_put_dma() to release the persistent DMA mapping
+  - fput(file) to release the bdev file
+  - io_put_rsrc_node() for the buffer ring
+  - kmem_cache_free(slot_cache, slot)
+  - ctx->io_slots[slot_id] = NULL
+
+The slot table:
+  - ctx->io_slots is a flexible array at the end of struct io_ring_ctx:
+      struct io_io_slot *io_slots[] __counted_by(nr_io_slots);
+  - nr_io_slots is set at ring creation time based on the IORING_SETUP_IO_SLOTS
+    flag and the slots field in struct io_uring_params
+  - Maximum number of slots is limited (typically 4096 or so)
+
+Questions that came up:
+
+Q: The slot->req is allocated from slot_cache, but when does it get freed?
+A: When the slot is unregistered. The slot->req isn't a separate allocation —
+   it's embedded in struct io_io_slot (the struct has a struct io_kiocb req
+   field), so it lives and dies with the slot. No per-IO allocation needed.
+
+Q: What guarantees slot_id validity across a re-register?
+A: When a slot is unregistered, its slot_id is freed. A new registration can
+   reuse the same slot_id. The register ioctl checks ctx->io_slots[slot_id]
+   == NULL before allocating, so you can't double-register. If you register,
+   unregister, and re-register the same slot_id, the old slot is fully torn
+   down before the new one is created.
+
+================================================================================
+Patch 11: 4ac8d063ed14 — "io_uring: support partitions for registered buffers"
+================================================================================
+
+When a registered slot targets a partition (e.g., /dev/nvme0n1p3), the IO
+submitted via submit_bio_noacct_fast must target the correct sector on the
+physical device. Partition block devices have bd_start_sect > 0.
+
+The fix is to use bdev->bd_start_sect when computing bi_sector:
+
+  slot->bio.bi_iter.bi_sector = (offset >> SECTOR_SHIFT) + bdev->bd_start_sect;
+
+Without this, the IO would be submitted against sector 0 of the physical
+device (the partition table area) instead of the partition's data area.
+
+The commit message notes that the block device file's ->f_mapping tells us
+about the partition offset. The bdev is obtained from the file's
+->f_path.dentry->d_inode->i_bdev.
+
+================================================================================
+Patch 10: 98ecbf760f54 — "io_uring: add support for concurrent IO on registered slots"
+================================================================================
+
+Normally each registered slot allows only one in-flight IO (serialized by the
+slot->busy flag). This patch adds overflow bio support so that concurrent IOs
+targeting the same slot can proceed without blocking.
+
+The overflow mechanism:
+
+  1. When an IO arrives and slot->busy is already 1 (an IO is in flight), the
+     submission code calls io_slot_alloc_overflow() instead of failing.
+
+  2. io_slot_alloc_overflow() allocates a new bio from the filesystem's bio_set:
+     struct bio *io_slot_alloc_overflow(struct io_io_slot *slot)
+     {
+         struct bio *bio = bio_alloc_bioset(bdev, slot->nr_bvec, ...);
+         // copy bvec layout from slot->bio
+         bio->bi_io_vec = slot->bio.bi_io_vec;  // reuse same bvec array
+         bio->bi_vcnt = slot->bio.bi_vcnt;
+         // store the overflow bio in a linked list on the slot
+         list_add_tail(&bio->bi_list, &slot->overflow_bios);
+         return bio;
+     }
+
+  3. Overflow bios share the same DMA mapping (via refcount on io_buf_dma).
+     They don't create new DMA mappings — they just use the existing one.
+
+  4. On completion, both the main bio and any overflow bios are completed.
+     The completion walks the overflow list:
+     list_for_each_entry_safe(bio, tmp, &slot->overflow_bios, bi_list) {
+         bio->bi_status = status;
+         bio_endio(bio);
+     }
+
+  5. The overflow bios are freed after completion (bio_put or bio_uninit).
+
+The slot still enforces one IO at a time via the busy flag — the difference is
+that instead of failing, it now queues the new IO as an overflow that will be
+submitted once the current IO completes. The actual parallelism comes from
+having multiple IOs in flight on different slots, but within a single slot,
+multiple concurrent submissions are pipelined via the overflow list.
+
+Wait — actually, re-reading the patch more carefully: the overflow bios are
+submitted concurrently with the main bio, not queued for later. The busy flag
+guards the slot struct, not the device. The different overflow bios can be in
+flight simultaneously because they target different sectors of the same buffer
+and can complete independently. The DMA mapping is shared (refcounted), so
+it stays alive as long as any overflow bio references it.
+
+================================================================================
+Patch 9: 665e6bd63945 — "io_uring/slot: persistent DMA mapping for registered buffers"
+================================================================================
+
+The core DMA mapping logic. This is where the persistent DMA mapping is
+created — once at slot registration time — and then reused for every IO
+on that slot without any dma_map/dma_unmap overhead.
+
+io_buf_dma_map() / io_imu_dma_map():
+
+  int io_imu_dma_map(struct io_mapped_ubuf *imu, struct io_slot_dma *dma,
+                     struct device *dma_dev, enum dma_data_direction dir)
+  {
+      // Two strategies, chosen at registration time:
+      //
+      // Strategy A: IOVA (IOMMU) path
+      //   - Build a scatterlist from the imu's bvecs
+      //   - Call dma_map_sg(dma_dev, sg, nents, dir)
+      //   - If dma_map_sg returns 1 entry → IOMMU coalesced the whole buffer
+      //     dma->use_iova = true
+      //     dma->state.addr = sg_dma_address(&sg[0])
+      //     No per-page tracking — the IOMMU page table handles it
+      //
+      // Strategy B: Direct (no-IOMMU) path
+      //   - If dma_map_sg returns >1 entries, or if the user disabled IOVA
+      //     dma->use_iova = false
+      //   - dma_map_page() each bvec individually
+      //   - Store each DMA address in dma->seg_addrs[]
+      //   - dma->nr_segs = number of segments
+
+The fallback from IOVA to direct happens at registration time, not at IO time.
+dma_map_sg first tries to create an IOVA mapping. If it can't coalesce (no IOMMU
+or the IOMMU can't map the whole range), it returns >1 entries, and we fall
+back to direct path.
+
+  struct io_slot_dma {
+      bool             use_iova;       // true = IOVA (single addr), false = direct
+      union {
+          struct {
+              dma_addr_t addr;         // IOVA base address
+          } state;
+      };
+      struct sg_table  sgt;           // scatter-gather table (for unmap)
+      dma_addr_t       *seg_addrs;    // per-segment DMA addrs (direct path only)
+      unsigned int     nr_segs;       // number of segments
+      unsigned int     folio_shift;   // uniform shift, copied from imu
+      size_t           len;           // total mapped length
+      struct device    *dma_dev;      // device used for DMA
+      enum dma_data_direction dir;    // read/write/bidirectional
+  };
+
+io_buf_dma_unmap() / io_imu_dma_unmap():
+
+  void io_imu_dma_unmap(struct io_mapped_ubuf *imu, struct io_slot_dma *dma)
+  {
+      if (dma->use_iova)
+          dma_unmap_sg(dma->dma_dev, dma->sgt.sgl, dma->sgt.nents, dma->dir);
+      else {
+          for (i = 0; i < dma->nr_segs; i++)
+              dma_unmap_page(dma->dma_dev, dma->seg_addrs[i],
+                             PAGE_SIZE << imu->folio_shift, dma->dir);
+          kfree(dma->seg_addrs);
+      }
+  }
+
+io_slot_buf_offset() — computes the byte offset of a bio's current position
+relative to the persistent DMA mapping base:
+
+  unsigned int io_slot_buf_offset(struct io_slot_dma *dma, struct bio *bio)
+  {
+      // For IOVA: offset = current bio position relative to buffer start
+      // Uses bi_iter.bi_sector to compute byte offset within the slot
+      // Uses folio_shift to determine page boundaries
+  }
+
+This is used by the NVMe fast path to adjust the DMA address by the current
+IO offset (since the same DMA mapping covers the whole buffer, but each IO
+only reads/writes a portion of it).
+
+struct io_buf_dma — the refcounted wrapper:
+
+  struct io_buf_dma {
+      struct list_head   list;        // for imu->dma_mappings list
+      struct io_slot_dma dma;         // the actual DMA mapping
+      struct device      *dma_dev;    // DMA device
+      refcount_t         refs;        // shared across slots with same (buf,dev)
+  };
+
+================================================================================
+Patch 8: 649b358554ed — "io_uring/slot: share persistent DMA mappings"
+================================================================================
+
+Deduplicates DMA mappings: if two slots use the same (buffer, device) pair,
+they share a single persistent DMA mapping instead of each creating their own.
+
+The sharing works via a cache on struct io_mapped_ubuf:
+
+  struct io_mapped_ubuf {
+      ...
+      struct list_head dma_mappings;   // list of struct io_buf_dma
+  };
+
+io_buf_get_dma(imu, dev):
+  - Walk imu->dma_mappings looking for an entry with matching dma_dev
+  - If found: refcount_inc(&bd->refs), return &bd->dma
+  - If not: create new mapping, add to list, return &bd->dma
+
+io_buf_put_dma(imu, dma):
+  - bd = container_of(dma, struct io_buf_dma, dma)
+  - if (refcount_dec_and_test(&bd->refs)):
+      - Call dma->driver_priv_destroy(dma) if set (NVMe PRP list teardown)
+      - io_imu_dma_unmap(imu, dma)
+      - list_del(&bd->list)
+      - kfree(bd)
+
+This matters because a single registered buffer can back multiple slots (same
+buffer ring, different offsets), and they all target the same device. Without
+sharing, each slot would do its own dma_map_sg / dma_map_page calls for the
+same pages — wasting IOMMU resources and memory for seg_addrs arrays.
+
+================================================================================
+Patch 7: f9cbe1a9b134 — "block: add bio_persistent_dma() helper"
+================================================================================
+
+Adds a helper to the block layer so drivers can retrieve the persistent DMA
+mapping from a registered bio:
+
+  struct io_slot_dma *bio_persistent_dma(struct bio *bio)
+  {
+      return bio->bi_private;
+  }
+
+This is used by the NVMe driver's fast path (patch 5) to get the pre-computed
+DMA mapping from a registered IO's bio.
+
+The bi_private field was already present on struct bio (used for various things
+like fs-layer private data). The slot code sets it at registration time:
+
+  slot->bio.bi_private = slot->dma;   // the persistent DMA mapping
+
+This patch creates the reverse dependency problem:
+  - include/linux/bio.h needs to declare: struct io_slot_dma *bio_persistent_dma(...)
+  - But struct io_slot_dma is defined in include/linux/io_uring_types.h
+  - bio.h can't include io_uring_types.h (that would make every block layer
+    user depend on io_uring)
+  - Solution in the original series: forward-declare struct io_slot_dma and
+    include io_uring_types.h only in the .c files that need it
+
+In the original code, bio.h uses a forward declaration:
+
+  struct io_slot_dma;
+  struct io_slot_dma *bio_persistent_dma(struct bio *bio);
+
+This works in C: you can return a pointer to an incomplete type as long as
+you don't dereference it. The caller (NVMe driver pci.c) includes
+io_uring_types.h to get the full struct definition so it can access members
+like dma->use_iova, dma->state.addr, etc.
+
+The forward declaration approach in C:
+  - A function declaration can use a pointer-to-incomplete-type as a parameter
+    or return type without the full definition being visible
+  - The caller must see the full definition before dereferencing the pointer
+  - This is different from C++ where the type must be complete in more contexts
+
+================================================================================
+Patch 6: 5d179cbf21b3 — "block: add RQF_REGISTERED flag"
+================================================================================
+
+Adds RQF_REGISTERED to the request flags and propagates BIO_REGISTERED from
+the bio to the request at bio→request conversion time.
+
+In enum rq_flag_bits (include/linux/blkdev.h or blk-mq.h):
+
+  RQF_REGISTERED = (__force req_flags_t)(1 << 25),
+  /* originates from a registered IO slot */
+
+The propagation happens in blk_mq_bio_to_request() which is called during
+bio submission:
+
+  if (bio->bi_opf & REQ_BIO_REGISTERED)
+      req->rq_flags |= RQF_REGISTERED;
+
+Why is this needed? During completion, the driver needs to know whether this
+IO came from a registered slot (to skip dma_unmap). By the time the request
+completes, the bio may already be freed. Having the flag on the request avoids
+needing to walk back to the bio.
+
+The flag is also used by nvme_unmap_data() and nvme_complete_batch() to skip
+the DMA unmap for registered IOs (see patch 5).
+
+When the registered fast path falls back (BLK_STS_AGAIN), nvme_map_data()
+clears RQF_REGISTERED so the completion path does the normal unmap:
+
+  req->rq_flags &= ~RQF_REGISTERED;
+
+================================================================================
+Patch 5: 537df61b0ba9 — "nvme-pci: add support for registered IO"
+================================================================================
+
+First NVMe driver wire-up. This is the consumer side — the actual fast path
+that uses the persistent DMA mapping.
+
+Additions to nvme.h (nvme_ctrl_ops):
+
+  struct device *(*dma_dev)(struct nvme_ctrl *ctrl);
+
+Returns the PCI DMA device. Set on disk->queue->dma_dev in nvme_alloc_ns():
+
+  if (ctrl->ops->dma_dev)
+      disk->queue->dma_dev = ctrl->ops->dma_dev(ctrl);
+
+nvme_pci_dma_dev() implementation:
+
+  static struct device *nvme_pci_dma_dev(struct nvme_ctrl *ctrl)
+  {
+      return to_nvme_dev(ctrl)->dev;
+  }
+
+Wired into nvme_pci_ctrl_ops:
+  .dma_dev = nvme_pci_dma_dev,
+
+nvme_pci_setup_data_registered() — the fast path:
+
+  static blk_status_t nvme_pci_setup_data_registered(struct request *req)
+  {
+      struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+      struct bio *bio = req->bio;
+      struct io_slot_dma *dma;
+      dma_addr_t dma_addr;
+      unsigned int total = blk_rq_payload_bytes(req);
+
+      if (!bio)
+          return BLK_STS_AGAIN;
+      dma = bio_persistent_dma(bio);
+      if (!dma)
+          return BLK_STS_AGAIN;
+
+      // Three cases for getting the DMA address:
+
+      // Case 1: IOVA (IOMMU coalesced)
+      if (dma_use_iova(&dma->state)) {
+          // The whole buffer is a single IOVA range
+          dma_addr = dma->state.addr + io_slot_buf_offset(dma, bio);
+
+      // Case 2: Direct path, physically contiguous
+      } else if (dma->nr_segs == 1) {
+          // Single DMA segment, offset within it
+          dma_addr = dma->seg_addrs[0] + bio->bi_iter.bi_bvec_done;
+
+      // Case 3: Multi-segment → can't handle directly
+      } else {
+          return BLK_STS_AGAIN;
+      }
+
+      // Check if it fits in 2 PRPs
+      unsigned int prp1_offset = dma_addr & (NVME_CTRL_PAGE_SIZE - 1);
+      if (total > NVME_CTRL_PAGE_SIZE * 2 - prp1_offset)
+          return BLK_STS_AGAIN;
+
+      // Build NVMe command with PRP1/PRP2 from the DMA address
+      iod->total_len = total;
+      iod->flags |= IOD_SINGLE_SEGMENT;
+      iod->cmd.common.dptr.prp1 = cpu_to_le64(dma_addr);
+      iod->cmd.common.dptr.prp2 = 0;
+      if (total > NVME_CTRL_PAGE_SIZE - prp1_offset) {
+          unsigned int first_prp_len = NVME_CTRL_PAGE_SIZE - prp1_offset;
+          iod->cmd.common.dptr.prp2 = cpu_to_le64(dma_addr + first_prp_len);
+      }
+      return BLK_STS_OK;
+  }
+
+nvme_map_data() — tries registered path first, falls back if BLK_STS_AGAIN:
+
+  static blk_status_t nvme_map_data(struct request *req)
+  {
+      blk_status_t ret;
+
+      // Try the registered fast path
+      ret = nvme_pci_setup_data_registered(req);
+      if (ret != BLK_STS_AGAIN)
+          return ret;
+
+      // Fallback: clear RQF_REGISTERED so completion does normal unmap
+      req->rq_flags &= ~RQF_REGISTERED;
+
+      // Normal dma_map path follows...
+      // (dma_map_page per segment via blk_rq_dma_map_iter_walk)
+  }
+
+nvme_unmap_data() — skip DMA unmap for registered IOs:
+
+  void nvme_unmap_data(struct request *req)
+  {
+      if (req->rq_flags & RQF_REGISTERED)
+          return;     // skip dma_unmap entirely
+
+      // normal unmap path...
+  }
+
+nvme_complete_batch() — skip unmap callback for registered:
+
+  void nvme_complete_batch(struct io_comp_batch *iob,
+                           void (*fn)(struct request *))
+  {
+      rq_list_for_each(&iob->req_list, req) {
+          if (!(req->rq_flags & RQF_REGISTERED))
+              fn(req);    // skip the unmap callback
+          nvme_complete_batch_req(req);
+      }
+  }
+
+The nvme.h include line in pci.c:
+
+  #include <linux/io_uring_types.h>
+
+This is the reverse dependency! pci.c needs the full definition of
+struct io_slot_dma to access dma->use_iova, dma->state.addr, dma->seg_addrs,
+dma->nr_segs, etc. This is the cross-layer include we cleaned up in the
+refactoring patch.
+
+================================================================================
+Patch 4: 34b074eaaa3a — "nvme-pci: use SGL fast path for any-size registered IO"
+================================================================================
+
+Extends the registered fast path from patch 5 to handle IOs larger than 2 NVMe
+pages by using a single SGL data descriptor.
+
+Before (patch 5):
+
+  if (total > NVME_CTRL_PAGE_SIZE * 2 - prp1_offset)
+      return BLK_STS_AGAIN;   // too big for 2 PRPs, fall back
+
+After (patch 4):
+
+  if (total > NVME_CTRL_PAGE_SIZE * 2 - prp1_offset) {
+      struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
+
+      // No SGL support (admin queue or PRP-only controller)?
+      if (!nvmeq->qid || !nvme_ctrl_sgl_supported(&nvmeq->dev->ctrl))
+          return BLK_STS_AGAIN;
+
+      // SGL fast path: single descriptor, no DMA walk
+      iod->total_len = total;
+      iod->flags |= IOD_SINGLE_SEGMENT;
+      iod->cmd.common.flags = NVME_CMD_SGL_METABUF;
+      iod->cmd.common.dptr.sgl.addr  = cpu_to_le64(dma_addr);
+      iod->cmd.common.dptr.sgl.length = cpu_to_le32(total);
+      iod->cmd.common.dptr.sgl.type  = NVME_SGL_FMT_DATA_DESC << 4;
+      return BLK_STS_OK;
+  }
+
+What is SGL? NVMe Scatter-Gather List format. The NVMe command can use either
+PRP (physical region page) or SGL (scatter-gather list) to describe data
+buffers. SGL is more flexible: a single SGL data descriptor can describe up
+to 2^32 bytes with a single (address, length) pair.
+
+The check nvmeq->qid ensures SGL is only used for IO queues:
+  - qid=0 is the admin queue which never uses SGL
+  - qid>0 is an IO queue
+
+The controller must advertise SGL support via the SGL Support field in the
+Controller Capabilities (CAP) register. nvme_ctrl_sgl_supported() checks this.
+
+SGL vs PRP performance:
+  - PRP doesn't require an extra DMA read — the PRP1 and PRP2 fields are
+    directly in the 64-byte submission queue entry (SQE). For small transfers
+    (≤2 pages), PRP is faster because there's no descriptor fetch.
+  - SGL requires the controller to DMA-read the SGL descriptor(s) from host
+    memory. For large transfers, this is negligible compared to the data xfer.
+  - The real win in this patch isn't SGL vs PRP — it's avoiding dma_map_page()
+    entirely. Whether you emit PRP or SGL, you use the same pre-computed
+    single DMA address, saving the per-IO DMA mapping of each page.
+
+Remaining limitation after this patch:
+  - PRP-only controllers with IOs >2 pages still fall back (BLK_STS_AGAIN)
+  - Multi-segment direct path (nr_segs > 1) still falls back
+  - Both are fixed by patch 1 (precomputed PRP list) and further work
+
+================================================================================
+Patch 3: bc95526a1bb1 — "block: add ->persistent_dma_setup() hook"
+================================================================================
+
+Tiny patch — adds a driver callback hook to struct request_queue:
+
+  struct request_queue {
+      ...
+      struct device *dma_dev;    // (from patch 5 setup)
+
+      int (*persistent_dma_setup)(struct request_queue *q,
+                                  struct io_slot_dma *dma);
+      ...
+  };
+
+This is the block-layer contract point. When a persistent DMA mapping is
+created for a given request_queue, the block layer calls this hook so the
+driver can build its own private data structures.
+
+The hook is called from io_buf_get_dma() (in patch 2):
+
+  if (q->persistent_dma_setup)
+      q->persistent_dma_setup(q, &bd->dma);
+
+For NVMe, this hook is implemented by nvme_pci_persistent_dma_setup() (patch 1),
+which builds a precomputed PRP list.
+
+The hook receives struct io_slot_dma * (the persistent DMA mapping) and
+returns 0 on success or a negative errno. If the setup fails, the entire
+slot registration fails.
+
+Note the reverse dependency: the callback takes struct io_slot_dma *, which
+is defined in io_uring_types.h. This means the block layer header must either
+include io_uring_types.h or forward-declare struct io_slot_dma. In the
+original, it uses a forward declaration.
+
+================================================================================
+Patch 2: 2e9c06025d7e — "io_uring/slot: add support for persistent driver DMA mappings"
+================================================================================
+
+Adds driver-private storage to struct io_slot_dma and wires up the
+persistent_dma_setup callback.
+
+New fields on struct io_slot_dma:
+
+  struct io_slot_dma {
+      ...
+      void  *driver_priv;                // driver-specific data
+      void  (*driver_priv_destroy)(struct io_slot_dma *dma);  // destructor
+  };
+
+driver_priv: The driver stores its private data here. For NVMe, this is
+struct nvme_pci_persistent_prp * (the precomputed PRP list).
+
+driver_priv_destroy: Called when the DMA mapping is being torn down (refcount
+hits 0), so the driver can free its private data. For NVMe, this is
+nvme_pci_persistent_dma_destroy() which does dma_free_coherent() for each
+PRP list page.
+
+The patch also changes io_buf_get_dma() to take struct request_queue * instead
+of struct device *:
+
+  // Before:
+  slot->dma = io_buf_get_dma(imu, bdev_get_queue(bdev)->dma_dev);
+
+  // After:
+  slot->dma = io_buf_get_dma(imu, bdev_get_queue(bdev));
+
+This is because io_buf_get_dma() now needs both:
+  - q->dma_dev (the device for dma_map/dma_unmap)
+  - q->persistent_dma_setup (the driver setup hook)
+
+The call to q->persistent_dma_setup is added in io_buf_get_dma() after
+the DMA mapping is created:
+
+  static struct io_slot_dma *io_buf_get_dma(struct io_mapped_ubuf *imu,
+                                            struct request_queue *q)
+  {
+      struct device *dma_dev = q->dma_dev;
+      struct io_buf_dma *bd;
+      int ret;
+
+      // ... walk imu->dma_mappings for existing mapping ...
+
+      // Create new mapping
+      ret = io_imu_dma_map(imu, &bd->dma, dma_dev, dir);
+      if (ret)
+          goto err;
+
+      // Driver setup hook
+      if (q->persistent_dma_setup) {
+          ret = q->persistent_dma_setup(q, &bd->dma);
+          if (ret) {
+              io_imu_dma_unmap(imu, &bd->dma);
+              goto err;
+          }
+      }
+
+      // ...
+  }
+
+And in io_buf_put_dma(), the destructor is called before unmapping:
+
+  static void io_buf_put_dma(struct io_mapped_ubuf *imu, struct io_slot_dma *dma)
+  {
+      struct io_buf_dma *bd = container_of(dma, struct io_buf_dma, dma);
+
+      if (!refcount_dec_and_test(&bd->refs))
+          return;
+
+      list_del(&bd->list);
+      if (dma->driver_priv_destroy)
+          dma->driver_priv_destroy(dma);      // free driver priv data
+      io_imu_dma_unmap(imu, &bd->dma);       // unmap DMA
+      kfree(bd);
+  }
+
+================================================================================
+Patch 1: 2c044c4a8f31 — "nvme-pci: precompute persistent PRP list for registered slots"
+================================================================================
+
+This is the top patch (last applied). It closes the final gap: making the
+registered fast path work for PRP-only controllers with IOs larger than 2
+NVMe pages. Without this patch, such IOs fall back to per-IO dma_map.
+
+The PRP list is built once at slot registration time and stored in
+dma->driver_priv. The per-IO fast path then sets PRP2 to point into this
+precomputed list.
+
+struct nvme_pci_persistent_prp:
+
+  struct nvme_pci_persistent_prp {
+      struct device   *dev;            // DMA device (for dma_alloc_coherent)
+      void            **list_va;       // CPU virtual address of each PRP page
+      dma_addr_t      *list_dma;       // DMA address of each PRP page
+      unsigned int    nr_list_pages;   // how many 4K PRP pages were allocated
+  };
+
+This mirrors the standard NVMe chained PRP list layout:
+  - Each "PRP page" is 4K (NVME_CTRL_PAGE_SIZE) of coherent DMA memory
+  - Each PRP page holds PRPS_PER_PAGE PRP entries (typically 511 on 4K pages,
+    since the last entry is used for chaining)
+  - PRP entries within a page are at: list[0], list[1], ..., list[PRPS_PER_PAGE-1]
+  - If the list spans multiple pages, page N's last entry (list[PRPS_PER_PAGE])
+    contains the DMA address of page N+1 (chain pointer)
+
+nvme_pci_persistent_dma_setup() — called from q->persistent_dma_setup hook:
+
+  static int nvme_pci_persistent_dma_setup(struct request_queue *q,
+                                           struct io_slot_dma *dma)
+  {
+      // Step 1: Determine the base DMA address
+      dma_addr_t base;
+      if (dma_use_iova(&dma->state))
+          base = dma->state.addr;              // IOVA: single coalesced address
+      else if (dma->nr_segs == 1)
+          base = dma->seg_addrs[0];            // Direct: single segment
+      else
+          return 0;                            // Multi-segment: can't build PRP list
+
+      // Step 2: Compute how many PRP entries we need
+      unsigned int page_off = base & (NVME_CTRL_PAGE_SIZE - 1);
+      dma_addr_t nvme_page_base = base & ~((dma_addr_t)NVME_CTRL_PAGE_SIZE - 1);
+      unsigned int total_pages = (page_off + dma->len + NVME_CTRL_PAGE_SIZE - 1)
+                                  >> NVME_CTRL_PAGE_SHIFT;
+
+      // If the transfer fits in 1 page (PRP1 only), no list needed
+      if (total_pages < 2)
+          return 0;
+
+      unsigned int nr_prps = total_pages - 1;  // PRP1 covers page 0
+
+      // Step 3: Allocate the PRP list structure
+      struct nvme_pci_persistent_prp *ppp = kzalloc(sizeof(*ppp), GFP_KERNEL_ACCOUNT);
+      ppp->dev = dma->dma_dev;
+      ppp->nr_list_pages = DIV_ROUND_UP(nr_prps, PRPS_PER_PAGE);
+
+      // Arrays to track PRP pages
+      ppp->list_va = kvmalloc_array(ppp->nr_list_pages, sizeof(*ppp->list_va),
+                                     GFP_KERNEL_ACCOUNT);
+      ppp->list_dma = kvmalloc_array(ppp->nr_list_pages, sizeof(*ppp->list_dma),
+                                      GFP_KERNEL_ACCOUNT);
+
+      // Step 4: Allocate coherent DMA pages for the PRP list
+      for (i = 0; i < ppp->nr_list_pages; i++) {
+          ppp->list_va[i] = dma_alloc_coherent(ppp->dev, NVME_CTRL_PAGE_SIZE,
+                                                &ppp->list_dma[i],
+                                                GFP_KERNEL_ACCOUNT);
+          if (!ppp->list_va[i])
+              goto err_free_pages;    // clean up on failure
+      }
+
+      // Step 5: Fill in the PRP entries
+      // Each entry points to page (i+1) of the data buffer
+      // (page 0 is covered by PRP1 in the command itself)
+      for (i = 0; i < nr_prps; i++) {
+          unsigned int list_idx = i / PRPS_PER_PAGE;
+          unsigned int entry_idx = i % PRPS_PER_PAGE;
+          __le64 *list = ppp->list_va[list_idx];
+          list[entry_idx] = cpu_to_le64(nvme_page_base +
+                              (i + 1) * NVME_CTRL_PAGE_SIZE);
+      }
+
+      // Step 6: Chain non-last PRP pages
+      // Each page's last entry (index PRPS_PER_PAGE) points to the next page
+      for (i = 0; i + 1 < ppp->nr_list_pages; i++) {
+          __le64 *list = ppp->list_va[i];
+          list[PRPS_PER_PAGE] = cpu_to_le64(ppp->list_dma[i + 1]);
+      }
+
+      // Step 7: Store the PRP list in the DMA mapping's driver_priv
+      dma->driver_priv = ppp;
+      dma->driver_priv_destroy = nvme_pci_persistent_dma_destroy;
+      return 0;
+
+  err_free_pages:
+      nvme_pci_persistent_prp_free(ppp);
+      return -ENOMEM;
+  }
+
+nvme_pci_persistent_prp_free() — frees the PRP list:
+
+  static void nvme_pci_persistent_prp_free(struct nvme_pci_persistent_prp *ppp)
+  {
+      if (!ppp)
+          return;
+      for (i = 0; i < ppp->nr_list_pages; i++)
+          dma_free_coherent(ppp->dev, NVME_CTRL_PAGE_SIZE,
+                            ppp->list_va[i], ppp->list_dma[i]);
+      kvfree(ppp->list_va);
+      kvfree(ppp->list_dma);
+      kfree(ppp);
+  }
+
+nvme_pci_persistent_dma_destroy() — the destructor callback:
+
+  static void nvme_pci_persistent_dma_destroy(struct io_slot_dma *dma)
+  {
+      nvme_pci_persistent_prp_free(dma->driver_priv);
+      dma->driver_priv = NULL;
+  }
+
+nvme_pci_persistent_prp_ptr() — the per-IO helper to get PRP2:
+
+  static dma_addr_t nvme_pci_persistent_prp_ptr(struct io_slot_dma *dma,
+                                                dma_addr_t dma_addr,
+                                                unsigned int prp1_offset)
+  {
+      struct nvme_pci_persistent_prp *ppp = dma->driver_priv;
+
+      if (!ppp)
+          return 0;
+
+      // Compute which page of the transfer is the first full page
+      dma_addr_t first_full_page = dma_addr + (NVME_CTRL_PAGE_SIZE - prp1_offset);
+
+      // Compute the base (page-aligned)
+      dma_addr_t base;
+      if (dma_use_iova(&dma->state))
+          base = dma->state.addr;
+      else
+          base = dma->seg_addrs[0];
+
+      // Compute the logical index within the PRP list
+      unsigned int logical_idx = (first_full_page -
+              (base & ~((dma_addr_t)NVME_CTRL_PAGE_SIZE - 1)))
+              >> NVME_CTRL_PAGE_SHIFT;
+      logical_idx--;    // list[0] = page 1 of buffer (page 0 is PRP1)
+
+      // Convert logical index to (page, entry) within the PRP list
+      unsigned int list_idx = logical_idx / PRPS_PER_PAGE;
+      unsigned int entry_idx = logical_idx % PRPS_PER_PAGE;
+
+      // Return the DMA address of that PRP entry
+      return ppp->list_dma[list_idx] + entry_idx * sizeof(__le64);
+  }
+
+Modified nvme_pci_setup_data_registered() — the updated fast path:
+
+  static blk_status_t nvme_pci_setup_data_registered(struct request *req)
+  {
+      // ... same initial checks as patch 5 ...
+
+      if (total > NVME_CTRL_PAGE_SIZE * 2 - prp1_offset) {
+          struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
+
+          // Try SGL first (patch 4 path)
+          if (nvmeq->qid && nvme_ctrl_sgl_supported(&nvmeq->dev->ctrl)) {
+              // ... SGL descriptor path ...
+              return BLK_STS_OK;
+          }
+
+          // PRP-only: use the precomputed list
+          if (!dma->driver_priv)
+              return BLK_STS_AGAIN;   // no list → fall back
+
+          // Set PRP1 to the data buffer address, PRP2 to point into the
+          // precomputed PRP list
+          iod->cmd.common.dptr.prp1 = cpu_to_le64(dma_addr);
+          iod->cmd.common.dptr.prp2 = cpu_to_le64(
+              nvme_pci_persistent_prp_ptr(dma, dma_addr, prp1_offset));
+          return BLK_STS_OK;
+      }
+
+      // Small IOs (≤2 pages): use inline PRP1/PRP2 as before
+      // ...
+  }
+
+Wiring in core.c:
+
+  disk->queue->persistent_dma_setup = ctrl->ops->persistent_dma_setup;
+
+Wiring in nvme_ctrl_ops:
+
+  .persistent_dma_setup = nvme_pci_persistent_dma_setup,
+
+Full lifecycle:
+
+  Slot registration:
+    1. io_imu_dma_map() creates the DMA mapping
+       ↳ dma_map_sg() or dma_map_page() — once
+    2. q->persistent_dma_setup() called
+       ↳ nvme_pci_persistent_dma_setup()
+         ↳ dma_alloc_coherent() for PRP list pages
+         ↳ fill PRP entries + chain pointers
+         ↳ dma->driver_priv = ppp
+
+  Every IO on that slot:
+    1. nvme_map_data() tries nvme_pci_setup_data_registered() first
+    2. Gets DMA address from dma (no dma_map call)
+    3. If >2 pages, computes PRP2 via nvme_pci_persistent_prp_ptr()
+       ↳ walks the precomputed PRP list, returns DMA addr of the right entry
+    4. Sets PRP1 and PRP2 in the NVMe command
+    5. Controller reads PRP list from coherent DMA memory
+    6. No dma_map_page, no list walk, no per-IO allocation
+
+  Slot unregistration:
+    1. dma->driver_priv_destroy() called
+       ↳ nvme_pci_persistent_dma_destroy()
+         ↳ dma_free_coherent() for each PRP list page
+    2. io_imu_dma_unmap() tears down DMA mapping
+       ↳ dma_unmap_sg() or dma_unmap_page()
+
+================================================================================
+Cross-Cutting: The Clean Layering Refactoring
+================================================================================
+
+The original series has a reverse dependency:
+  - include/linux/bio.h defines bio_persistent_dma() returning
+    struct io_slot_dma * (defined in io_uring_types.h)
+  - drivers/nvme/host/pci.c #includes <linux/io_uring_types.h> to access
+    struct io_slot_dma members directly
+  - The block queue callback persistent_dma_setup also takes struct io_slot_dma *
+  - Result: drivers have a hard dependency on io_uring headers
+
+Our refactoring fixes this by:
+  1. Moving struct io_slot_dma → struct blk_persistent_dma (opaque handle)
+  2. Defining the struct in block/blk-persistent-dma.c (block layer owns it)
+  3. Creating include/linux/blk-persistent-dma.h with 14 accessor functions
+  4. Updating all users to use the accessor API
+  5. NVMe pci.c includes <linux/blk-persistent-dma.h> instead of
+     <linux/io_uring_types.h>
+
+The accessor API:
+  - blk_persistent_dma_use_iova(dma)    → dma->use_iova
+  - blk_persistent_dma_addr(dma)        → dma->state.addr
+  - blk_persistent_dma_seg_addrs(dma)   → dma->seg_addrs
+  - blk_persistent_dma_nr_segs(dma)     → dma->nr_segs
+  - blk_persistent_dma_folio_shift(dma) → dma->folio_shift
+  - blk_persistent_dma_dev(dma)         → dma->dma_dev
+  - blk_persistent_dma_dir(dma)         → dma->dir
+  - blk_persistent_dma_len(dma)         → dma->len
+  - blk_persistent_dma_driver_priv(dma)      → dma->driver_priv
+  - blk_persistent_dma_set_driver_priv(dma, p)   → dma->driver_priv = p
+  - blk_persistent_dma_driver_priv_destroy(dma)  → dma->driver_priv_destroy
+  - blk_persistent_dma_set_driver_priv_destroy(dma, fn)
+  - blk_persistent_dma_map(q, imu, dir)      → io_buf_get_dma
+  - blk_persistent_dma_unmap(dma)             → io_buf_put_dma
+  - blk_persistent_dma_sync(dma, bio)         → io_slot_dma_sync
+  - blk_persistent_dma_buf_offset(dma, bio)   → io_slot_buf_offset
+  - blk_persistent_dma_setup(q, dma)          → calls q->persistent_dma_setup
+
+Files changed by the refactoring:
+  + include/linux/blk-persistent-dma.h  (new)
+  + block/blk-persistent-dma.c          (new)
+  M include/linux/bio.h                 (return type change)
+  M include/linux/io_uring_types.h      (remove struct io_slot_dma, add include)
+  M include/linux/blkdev.h              (callback signature update)
+  M io_uring/slot.c                     (use blk_persistent_dma API)
+  M io_uring/rsrc.h                     (remove dma_mappings list)
+  M io_uring/rsrc.c                     (remove list init + WARN_ON)
+  M drivers/nvme/host/pci.c             (include blk-persistent-dma.h, use API)
+  M drivers/nvme/host/nvme.h            (callback signature update)
+  M block/Makefile                      (add blk-persistent-dma.o)
+
+The refactoring patch is saved at:
+  patches/0001-block-persistent-dma-clean-layering.patch
