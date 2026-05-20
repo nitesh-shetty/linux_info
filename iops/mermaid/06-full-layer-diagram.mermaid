@@ -1,0 +1,86 @@
+flowchart TB
+    subgraph Userspace["Userspace"]
+        direction LR
+        APP["Application<br/>(io_uring user)"]
+        LIB["liburing<br/>(SQ/CQ ring mgmt)"]
+    end
+
+    subgraph IO_URING["io_uring (kernel)"]
+        direction TB
+        REG["io_register_io_slot()"]
+        SUB["io_slot_rw_issue()"]
+        SLOT["struct io_io_slot"]
+        BIO["slot->bio (embedded)"]
+        REQ["slot->req (pre-alloc kiocb)"]
+        DMA["slot->dma<br/>(struct blk_persistent_dma)"]
+    end
+
+    subgraph BLOCK["Block Layer"]
+        direction TB
+        FAST["submit_bio_noacct_fast()"]
+        MQ["blk_mq_submit_bio()"]
+        FLAG["BIO_REGISTERED -> RQF_REGISTERED"]
+        QUEUE["request_queue"]
+        DMA_DEV["q->dma_dev"]
+        HOOK["q->persistent_dma_setup"]
+    end
+
+    subgraph NVME["NVMe Driver (pci.c)"]
+        direction TB
+        SETUP["nvme_pci_persistent_dma_setup()"]
+        FAST_IO["nvme_pci_setup_data_registered()"]
+        PRP_PTR["nvme_pci_persistent_prp_ptr()"]
+        UNMAP["nvme_unmap_data()"]
+    end
+
+    subgraph HW["NVMe Controller"]
+        direction LR
+        SQ["Submission Queue"]
+        DMA_ENG["PCIe DMA Engine"]
+        CQ["Completion Queue"]
+    end
+
+    APP -->|io_uring_enter| LIB
+    LIB -->|IORING_OP_SLOT_RW| SUB
+    LIB -->|IORING_REGISTER_IO_SLOT| REG
+
+    REG --> SLOT
+    SLOT --> BIO
+    SLOT --> REQ
+    SLOT --> DMA
+
+    SUB -->|submit_bio_noacct_fast| BLOCK
+
+    BIO -.->|bi_private = dma| DMA
+
+    BLOCK --> MQ
+    MQ --> FLAG
+    FLAG -->|RQF_REGISTERED| NVME
+
+    QUEUE --> DMA_DEV
+    QUEUE --> HOOK
+
+    REG -->|io_buf_get_dma| DMA
+    DMA -..->|dma_dev| DMA_DEV
+    DMA -..->|dma_map_sg/page| HW
+
+    HOOK -->|persistent_dma_setup| SETUP
+    SETUP -->|dma_alloc_coherent x N| PRP_PTR
+    SETUP -->|dma->driver_priv| DMA
+
+    FAST_IO -->|bio_persistent_dma()| DMA
+    FAST_IO -->|PRP1/PRP2 in SQE| SQ
+
+    PRP_PTR -.->|PRP2 address| FAST_IO
+
+    SQ -->|PCIe TLP| DMA_ENG
+    DMA_ENG -->|DMA xfer| MEM["Host Memory<br/>(data buffer)"]
+    DMA_ENG -->|CQE| CQ
+
+    CQ -->|MSI-X / iopoll| UNMAP
+    UNMAP -.->|RQF_REGISTERED? skip| FAST_IO
+
+    style DMA fill:#bfb,stroke:#090
+    style FAST_IO fill:#bfb,stroke:#090
+    style SETUP fill:#bbf,stroke:#009
+    style PRP_PTR fill:#bbf,stroke:#009

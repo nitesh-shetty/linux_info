@@ -1,0 +1,47 @@
+sequenceDiagram
+    participant U as Userspace
+    participant IO as io_uring
+    participant NVMe as NVMe Driver
+    participant HW as NVMe Controller
+
+    U->>IO: SQE: IORING_OP_SLOT_RW (slot_id, offset, len)
+    activate IO
+
+    IO->>IO: io_slot_rw_prep: lookup slot
+
+    IO->>IO: io_slot_rw_issue: slot->busy = 1
+
+    Note over IO: configure slot->bio<br/>bi_sector = offset >> 9<br/>bi_size = len<br/>bi_opf = OP | BIO_REGISTERED | IOCB_IOPOLL
+
+    IO->>NVMe: submit_bio_noacct_fast() -> nvme_queue_rq()
+    deactivate IO
+    activate NVMe
+
+    NVMe->>NVMe: nvme_map_data(req)
+    NVMe->>NVMe: nvme_pci_setup_data_registered(req)
+    Note over NVMe: dma = bio_persistent_dma(bio)
+
+    alt IOVA path
+        Note over NVMe: dma_addr = dma->state.addr + buf_offset(dma, bio)
+    else direct, single segment
+        Note over NVMe: dma_addr = dma->seg_addrs[0] + bi_bvec_done
+    else multi-segment direct
+        Note over NVMe: return BLK_STS_AGAIN (fallback)
+    end
+
+    alt <= 2 NVMe pages
+        Note over NVMe: PRP1 = cpu_to_le64(dma_addr)<br/>PRP2 = 0 or dma_addr + first_prp_len<br/>--- ZERO dma_map CALLS ---
+    else >2 pages + SGL capable
+        Note over NVMe: Single SGL descriptor:
+        Note over NVMe: sgl.addr  = dma_addr<br/>sgl.length = total<br/>--- ZERO dma_map CALLS ---
+    else >2 pages + PRP-only + PRP list
+        Note over NVMe: PRP1 = dma_addr
+        Note over NVMe: PRP2 = nvme_pci_persistent_prp_ptr()
+        Note over NVMe: --- ZERO dma_map CALLS ---
+    else fallback (BLK_STS_AGAIN)
+        Note over NVMe: clear RQF_REGISTERED
+        Note over NVMe: dma_map_page() per page (slow path)
+    end
+
+    NVMe->>HW: ring SQ doorbell
+    deactivate NVMe

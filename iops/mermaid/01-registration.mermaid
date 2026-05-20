@@ -1,0 +1,49 @@
+sequenceDiagram
+    participant U as Userspace
+    participant IO as io_uring
+    participant DMA as DMA API
+    participant NVMe as NVMe Driver
+
+    U->>IO: io_uring_register(IO_SLOT, &reg)
+    activate IO
+
+    IO->>IO: validate slot_id, buf_ring, file_fd
+    IO->>IO: alloc io_io_slot from slot_cache
+
+    IO->>IO: io_slot_alloc_bio()
+    Note over IO: slot->bio.bi_io_vec = imu->bvec[]
+
+    IO->>IO: io_buf_get_dma(imu, q)
+
+    alt existing mapping for (imu, dev)
+        IO->>IO: refcount_inc, reuse
+    else new mapping
+        IO->>DMA: dma_map_sg(dev, sg, nents, dir)
+        alt IOMMU coalesced (returned 1 entry)
+            Note over DMA: dma->use_iova = true
+            Note over DMA: dma->state.addr = sg_dma_address(sg)
+        else no IOMMU / can't coalesce
+            loop each bvec
+                DMA->>DMA: dma_map_page()
+            end
+            Note over DMA: dma->use_iova = false
+            Note over DMA: dma->seg_addrs[] = mapped addrs
+        end
+
+        IO->>NVMe: q->persistent_dma_setup(q, dma)
+        activate NVMe
+        Note over NVMe: nvme_pci_persistent_dma_setup()
+        Note over NVMe: skip if IOVA or nr_segs > 1
+        alt needs PRP list
+            NVMe->>DMA: dma_alloc_coherent() x N pages
+            Note over NVMe: fill PRP entries, chain pages
+            Note over NVMe: dma->driver_priv = ppp
+        end
+        NVMe-->>IO: return 0
+        deactivate NVMe
+    end
+
+    Note over IO: slot->bio.bi_private = slot->dma
+    Note over IO: ctx->io_slots[slot_id] = slot
+    IO-->>U: return 0 (success)
+    deactivate IO

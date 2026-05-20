@@ -1,0 +1,26 @@
+sequenceDiagram
+    participant HW as NVMe Controller
+    participant NVMe as NVMe Driver
+    participant IO as io_uring
+    participant U as Userspace
+
+    HW->>NVMe: CQE arrives (MSI-X interrupt or iopoll)
+    activate NVMe
+
+    NVMe->>NVMe: nvme_pci_complete_rq()
+
+    alt RQF_REGISTERED is set
+        Note over NVMe: SKIP dma_unmap entirely<br/>(slot owns the persistent mapping)
+    else normal IO (no RQF_REGISTERED)
+        Note over NVMe: nvme_unmap_data():
+        Note over NVMe: dma_unmap_page() per segment
+    end
+
+    NVMe->>IO: blk_mq_end_request() / bio_endio()
+    deactivate NVMe
+    activate IO
+
+    Note over IO: slot->busy = 0
+
+    IO->>U: CQE visible in userspace CQ ring
+    deactivate IO

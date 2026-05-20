@@ -1,0 +1,35 @@
+block-beta
+    columns 3
+
+    block:normal_io:1
+        columns 1
+        title["Normal IO (per-IO)"]
+        style title fill:#fbb,stroke:#c00
+        N1["Allocate bio + io_kiocb"]
+        N2["dma_map_page() x N"]
+        N3["Allocate + fill PRP/SGL"]
+        N4["Submit to NVMe HW"]
+        N5["Wait for completion"]
+        N6["dma_unmap_page() x N"]
+        N7["Free PRP list + bio + kiocb"]
+    end
+
+    block:middle:1
+        style middle fill:transparent,stroke:transparent
+        M[" "]
+    end
+
+    block:slot_io:1
+        columns 1
+        title["Registered Slot IO"]
+        style title fill:#bfb,stroke:#090
+        S1["Reuse embedded bio + kiocb"]
+        S2["0 dma_map calls"]
+        S3["0 PRP alloc (precomputed at reg)"]
+        S4["Submit to NVMe HW"]
+        S5["Wait for completion"]
+        S6["0 dma_unmap calls (slot owns it)"]
+        S7["0 free (reused for next IO)"]
+    end
+
+    normal_io --> slot_io : "savings per IO"

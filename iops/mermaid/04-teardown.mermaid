@@ -1,0 +1,39 @@
+sequenceDiagram
+    participant U as Userspace
+    participant IO as io_uring
+    participant NVMe as NVMe Driver
+    participant DMA as DMA API
+
+    U->>IO: io_uring_register(UNREGISTER_IO_SLOT, &slot_id)
+    activate IO
+
+    IO->>IO: io_free_io_slot(slot)
+    IO->>IO: io_buf_put_dma(slot->dma)
+
+    alt refs == 0 (no other slot shares this mapping)
+        IO->>NVMe: dma->driver_priv_destroy(dma)
+        activate NVMe
+        NVMe->>DMA: dma_free_coherent() x N pages
+        Note over NVMe: frees precomputed PRP list
+        deactivate NVMe
+
+        alt IOVA path
+            DMA->>DMA: dma_unmap_sg()
+        else direct path
+            loop each segment
+                DMA->>DMA: dma_unmap_page()
+            end
+        end
+
+        IO->>IO: kfree(bd)
+    else refs > 0 (shared with other slots)
+        Note over IO: just decrement refcount
+    end
+
+    IO->>IO: fput(slot->file)
+    IO->>IO: io_put_rsrc_node(slot->imu)
+    IO->>IO: kmem_cache_free(slot_cache, slot)
+    Note over IO: ctx->io_slots[slot_id] = NULL
+
+    IO-->>U: return 0
+    deactivate IO
