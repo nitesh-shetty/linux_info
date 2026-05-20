@@ -1,8 +1,8 @@
 flowchart TB
     subgraph Userspace["Userspace"]
         direction LR
-        APP["Application<br/>(io_uring user)"]
-        LIB["liburing<br/>(SQ/CQ ring mgmt)"]
+        APP["Application (io_uring user)"]
+        LIB["liburing (SQ/CQ ring mgmt)"]
     end
 
     subgraph IO_URING["io_uring (kernel)"]
@@ -12,7 +12,7 @@ flowchart TB
         SLOT["struct io_io_slot"]
         BIO["slot->bio (embedded)"]
         REQ["slot->req (pre-alloc kiocb)"]
-        DMA["slot->dma<br/>(struct blk_persistent_dma)"]
+        DMA["slot->dma<br/>(blk_persistent_dma)"]
     end
 
     subgraph BLOCK["Block Layer"]
@@ -65,16 +65,16 @@ flowchart TB
     DMA -..->|dma_map_sg/page| HW
 
     HOOK -->|persistent_dma_setup| SETUP
-    SETUP -->|dma_alloc_coherent x N| PRP_PTR
-    SETUP -->|dma->driver_priv| DMA
+    SETUP -->|dma_alloc_coherent| PRP_PTR
+    SETUP -->|driver_priv| DMA
 
-    FAST_IO -->|bio_persistent_dma()| DMA
+    FAST_IO -->|bio_persistent_dma| DMA
     FAST_IO -->|PRP1/PRP2 in SQE| SQ
 
     PRP_PTR -.->|PRP2 address| FAST_IO
 
     SQ -->|PCIe TLP| DMA_ENG
-    DMA_ENG -->|DMA xfer| MEM["Host Memory<br/>(data buffer)"]
+    DMA_ENG -->|DMA xfer| MEM["Host Memory (data buffer)"]
     DMA_ENG -->|CQE| CQ
 
     CQ -->|MSI-X / iopoll| UNMAP

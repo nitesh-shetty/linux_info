@@ -1,35 +1,29 @@
-block-beta
-    columns 3
-
-    block:normal_io:1
-        columns 1
-        title["Normal IO (per-IO)"]
-        style title fill:#fbb,stroke:#c00
+flowchart LR
+    subgraph Normal["Normal IO (per-IO)"]
+        direction TB
         N1["Allocate bio + io_kiocb"]
         N2["dma_map_page() x N"]
-        N3["Allocate + fill PRP/SGL"]
+        N3["Allocate + fill PRP/SGL entries"]
         N4["Submit to NVMe HW"]
-        N5["Wait for completion"]
-        N6["dma_unmap_page() x N"]
-        N7["Free PRP list + bio + kiocb"]
+        N5["dma_unmap_page() x N"]
+        N6["Free PRP list + bio + kiocb"]
     end
 
-    block:middle:1
-        style middle fill:transparent,stroke:transparent
-        M[" "]
-    end
+    Normal -->|each IO| Cost1["Cost: N * dma_map + N * dma_unmap<br/>+ alloc/free per IO"]
 
-    block:slot_io:1
-        columns 1
-        title["Registered Slot IO"]
-        style title fill:#bfb,stroke:#090
-        S1["Reuse embedded bio + kiocb"]
-        S2["0 dma_map calls"]
-        S3["0 PRP alloc (precomputed at reg)"]
+    subgraph Slot["Registered Slot IO (per-IO)"]
+        direction TB
+        S1["Reuse embedded bio + kiocb (0 alloc)"]
+        S2["0 dma_map (precomputed at registration)"]
+        S3["0 PRP alloc (precomputed at registration)"]
         S4["Submit to NVMe HW"]
-        S5["Wait for completion"]
-        S6["0 dma_unmap calls (slot owns it)"]
-        S7["0 free (reused for next IO)"]
+        S5["0 dma_unmap (slot owns the mapping)"]
+        S6["0 free (reused for next IO)"]
     end
 
-    normal_io --> slot_io : "savings per IO"
+    Slot -->|each IO| Cost2["Cost: 0 dma calls<br/>+ 0 alloc/free"]
+
+    style Normal fill:#fdd,stroke:#c00
+    style Slot fill:#dfd,stroke:#090
+    style Cost1 fill:#fee,stroke:#c00
+    style Cost2 fill:#efe,stroke:#090
