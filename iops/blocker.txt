@@ -1,0 +1,124 @@
+Missing Pieces for Upstreaming Registered IO Slots (IOPS)
+=========================================================
+
+Series: 17 patches adding IORING_OP_SLOT_RW, persistent DMA mappings,
+        submit_bio_noacct_fast(), NVMe PCI fast path, precomputed PRP lists.
+
+================================================================================
+CRITICAL BLOCKERS
+================================================================================
+
+1. Layering violation: io_uring_types.h leak into block layer + driver
+----------------------------------------------------------------------
+  - struct io_slot_dma is defined in include/linux/io_uring_types.h but is
+    consumed by:
+      * include/linux/bio.h         (bio_persistent_dma() returns io_slot_dma*)
+      * include/linux/blkdev.h      (persistent_dma_setup callback takes it)
+      * drivers/nvme/host/pci.c     (includes io_uring_types.h directly)
+  - A driver MUST NOT include io_uring headers. Block layer headers MUST NOT
+    depend on io_uring types.
+  - Fix: move struct io_slot_dma → struct blk_persistent_dma (opaque, owned by
+    block layer), define in block/blk-persistent-dma.c, expose accessor functions
+    via include/linux/blk-persistent-dma.h. (Noted in analysis, not in patches.)
+
+2. struct device *dma_dev on struct request_queue
+----------------------------------------------------------------------
+  - Patch 9 adds a new field to one of the most core structures in the kernel.
+  - Used only by io_uring slots. Every other queue pays the memory cost.
+  - Maintainer pushback is guaranteed. Should be a separate registration
+    mechanism (e.g., helper keyed by queue + device, not embedded).
+
+3. submit_bio_noacct_fast() EXPORT_SYMBOL with single caller
+----------------------------------------------------------------------
+  - New block layer export used only by io_uring. Not justified.
+  - Skipped because normal submit_bio_noacct() path does multiple things slot
+    IOs don't need, but if they're truly unnecessary, the proper approach is
+    to document which preconditions allow bypassing them — not add a new export.
+
+4. Only NVMe PCI wired up
+----------------------------------------------------------------------
+  - New block layer feature must have at least 2 independent drivers.
+  - nvme-fabrics (TCP/RDMA/FC) is not wired. Neither are virtio-blk, ublk, etc.
+  - The ->persistent_dma_setup hook and queue->dma_dev are NVMe-pci-only.
+
+5. No blkcg / cgroup / iocost integration
+----------------------------------------------------------------------
+  - submit_bio_noacct_fast() bypasses __bio_associate_blkg(), blkcg_iolatency,
+    iocost, and all cgroup writeback tracking.
+  - Slot IOs are invisible to cgroup controllers, breaking multi-tenant
+    isolation and costing.
+
+6. No ioprio support
+----------------------------------------------------------------------
+  - bio_set_ioprio() is called in submit_bio_noacct() but not in the fast path.
+  - Slot IOs always get IOPRIO_CLASS_NONE regardless of SQE ioprio.
+  - With mq-deadline or BFQ, slot IOs compete unfairly (or are mis-prioritised).
+
+================================================================================
+MODERATE CONCERNS
+================================================================================
+
+7. bio->bi_private hijacking
+----------------------------------------------------------------------
+  - bi_private is a generic field:
+      * FS direct I/O stores kiocb there (kiocb->private = bio)
+      * Block internal paths (e.g., bio-based drivers) use it
+      * Slot code stores io_slot_dma* there
+  - For direct-to-device slot IOs (no stacking, no FS in the path) this is safe
+    in practice, but there is no type-safety or layering.
+  - A dedicated field (bi_private_slot or bi_persistent_dma) would avoid
+    potential conflicts with future block layer changes.
+
+8. Stack-allocated fake kiocb in io_slot_iopoll()
+----------------------------------------------------------------------
+  - Patch 5 creates a local struct kiocb with only ki_filp + private set:
+        kiocb = (struct kiocb){
+            .ki_filp  = file,
+            .private  = rw->bio,
+        };
+  - If the driver's ->iopoll callback dereferences any other kiocb field
+    (ki_complete, ki_flags, ki_pos, etc.), this is a silent read of stack
+    garbage → undefined behaviour or UAF crash.
+  - NVMe's ->iopoll currently only uses ki_filp + private, but nothing
+    enforces this contract. A small driver change would cause a hard-to-debug
+    crash.
+
+9. io_slot_overflow_bio_end_io always reports full nbytes
+----------------------------------------------------------------------
+  - If a transfer completes partially (less than rw->nbytes bytes), the
+    completion reports rw->nbytes as the result, not the actual transfer size.
+  - The inline path (io_slot_bio_end_io) does check for errors via
+    bi_status, but still reports full nbytes on success regardless of actual
+    completed length.
+  - Compare with normal io_complete_rw() which reports the actual residual.
+
+================================================================================
+NICE-TO-HAVE / CLEANUP
+================================================================================
+
+10. No Documentation/ for new UAPI
+-----------------------------------
+  - IORING_OP_SLOT_RW, IORING_REGISTER_IO_SLOT (38), IORING_UNREGISTER_IO_SLOT
+    (39), and struct io_uring_slot_reg have no documentation in
+    Documentation/userspace-api/io_uring.rst or similar.
+
+11. No tests
+-------------
+  - No blktests, liburing tests, or kselftests. No way to verify correctness
+    or performance claims upstream.
+
+12. No write hint / stream ID propagation
+------------------------------------------
+  - REQ_OP_WRITE submitted via slots don't propagate write hints
+    (bi_write_hint / RWF_DSYNC etc.) that normal write path supports.
+
+13. No integrity / DIF/DIX support
+-----------------------------------
+  - BIO_REGISTERED bios skip bio_integrity_prep entirely. If the device
+    uses integrity metadata (T10 PI), slot IOs will fail or corrupt data.
+
+14. Overflow bios not free-able under memory pressure
+------------------------------------------------------
+  - The overflow path (patch 8) uses kmalloc(GFP_KERNEL) for io_slot_overflow.
+    Under direct reclaim, this might fail where a normal bio allocation
+    (bio_alloc with mempool) would succeed.
