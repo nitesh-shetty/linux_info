@@ -1,5 +1,5 @@
 ```mermaid
-flowchart LR
+flowchart TB
     A2 -->|2| B2(io_read)
     B2 --> C2(__io_read)
     C2 --> D2(io_iter_do_read)
